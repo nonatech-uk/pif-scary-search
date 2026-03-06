@@ -44,7 +44,7 @@ async def _fetch_all_pages(
     """Fetch all pages from a paginated Paperless API endpoint."""
     results = []
     url = f"{PAPERLESS_URL}{path}"
-    req_params = {"page_size": 100, **(params or {})}
+    req_params: dict | None = {"page_size": 100, **(params or {})}
     while True:
         resp = await client.get(url, params=req_params)
         resp.raise_for_status()
@@ -54,7 +54,7 @@ async def _fetch_all_pages(
         if not next_url:
             break
         url = next_url
-        req_params = {}  # next URL already includes params
+        req_params = None  # next URL already includes all params
     return results
 
 
@@ -69,10 +69,14 @@ async def _ensure_index(meili: httpx.AsyncClient):
     if resp.status_code not in (200, 202, 409):
         resp.raise_for_status()
 
-    # Wait for task if created
+    # Wait for task if created — ignore "already exists"
     if resp.status_code == 202:
         task = resp.json()
-        await _wait_task(meili, task["taskUid"])
+        try:
+            await _wait_task(meili, task["taskUid"])
+        except RuntimeError as e:
+            if "index_already_exists" not in str(e):
+                raise
 
     # Update settings
     settings = {
