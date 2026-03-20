@@ -7,6 +7,8 @@ from fastmcp import FastMCP
 
 TAUTULLI_URL = os.environ.get("TAUTULLI_URL", "http://tautulli:8181")
 TAUTULLI_API_KEY = os.environ["TAUTULLI_API_KEY"]
+TAUTULLI_USER = os.environ.get("TAUTULLI_USER", "")
+TAUTULLI_USER_ID = os.environ.get("TAUTULLI_USER_ID", "")
 
 mcp = FastMCP("tautulli-search")
 
@@ -48,6 +50,8 @@ def _format_table(rows: list[dict], keys: list[str]) -> str:
 @mcp.tool
 async def tautulli_history(
     length: int = 25,
+    start: int = 0,
+    order_dir: str = "desc",
     user: str | None = None,
     media_type: str | None = None,
     search: str | None = None,
@@ -55,13 +59,17 @@ async def tautulli_history(
     """Get Plex watch history from Tautulli.
 
     Args:
-        length: Number of records to return (default 25, max 100)
+        length: Number of records to return (default 25, max 500)
+        start: Offset for pagination (default 0). Use with length to page through results.
+        order_dir: Sort order by date — 'desc' (newest first) or 'asc' (oldest first)
         user: Filter by username/friendly name
         media_type: Filter by type — 'movie', 'episode', 'track'
         search: Search for title
     """
-    params = {"length": min(length, 100)}
-    if user:
+    params = {"length": min(length, 500), "start": start, "order_dir": order_dir}
+    if TAUTULLI_USER:
+        params["user"] = TAUTULLI_USER
+    elif user:
         params["user"] = user
     if media_type:
         params["media_type"] = media_type
@@ -89,7 +97,7 @@ async def tautulli_history(
         })
 
     total = data.get("recordsFiltered", len(rows))
-    header = f"Watch history ({total} total records):\n\n"
+    header = f"Watch history (showing {start + 1}-{start + len(rows)} of {total}, {order_dir}):\n\n"
     return header + _format_table(result_rows, ["date", "user", "title", "type", "duration", "platform", "decision"])
 
 
@@ -109,11 +117,15 @@ async def tautulli_most_watched(
     stat_map = {"movie": "top_movies", "tv": "top_tv", "music": "top_music"}
     stat_id = stat_map.get(media_type, f"top_{media_type}")
 
+    extra = {}
+    if TAUTULLI_USER_ID:
+        extra["user_id"] = TAUTULLI_USER_ID
     data = await _api(
         "get_home_stats",
         time_range=time_range,
         stats_type="duration",
         stats_count=stats_count,
+        **extra,
     )
 
     target = None
@@ -149,12 +161,13 @@ async def tautulli_user_stats(
     Args:
         user_id: Optional Tautulli user_id. Omit to get summary for all users.
     """
-    if user_id:
-        data = await _api("get_user_watch_time_stats", user_id=user_id)
+    uid = int(TAUTULLI_USER_ID) if TAUTULLI_USER_ID else user_id
+    if uid:
+        data = await _api("get_user_watch_time_stats", user_id=uid)
         if not data:
-            return f"No stats found for user {user_id}."
+            return f"No stats found for user {uid}."
 
-        lines = [f"Watch stats for user {user_id}:\n"]
+        lines = [f"Watch stats for user {uid}:\n"]
         for period in data:
             lines.append(
                 f"  Last {period.get('query_days', '?')} days: "
@@ -191,7 +204,10 @@ async def tautulli_watch_stats(
         time_range: Number of days to look back (default 30)
         y_axis: 'plays' for play count or 'duration' for total watch time
     """
-    data = await _api("get_plays_by_date", time_range=time_range, y_axis=y_axis)
+    extra = {}
+    if TAUTULLI_USER_ID:
+        extra["user_id"] = TAUTULLI_USER_ID
+    data = await _api("get_plays_by_date", time_range=time_range, y_axis=y_axis, **extra)
     if not data or not data.get("series"):
         return "No play data found."
 
@@ -219,4 +235,5 @@ async def tautulli_watch_stats(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    from mcp_search.run import serve
+    serve(mcp)

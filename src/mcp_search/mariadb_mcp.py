@@ -265,4 +265,5 @@ async def ha_statistics(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    from mcp_search.run import serve
+    serve(mcp)

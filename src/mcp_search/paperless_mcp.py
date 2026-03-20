@@ -285,4 +285,5 @@ async def paperless_download_url(document_id: int, original: bool = False) -> st
 
 
 if __name__ == "__main__":
-    mcp.run()
+    from mcp_search.run import serve
+    serve(mcp)

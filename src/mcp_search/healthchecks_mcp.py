@@ -195,4 +195,5 @@ async def hc_ping_history(name: str, limit: int = 10) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    from mcp_search.run import serve
+    serve(mcp)
