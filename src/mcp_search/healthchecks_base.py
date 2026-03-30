@@ -1,20 +1,37 @@
 """Shared factory for Healthchecks MCP servers with multi-project support."""
 
 import os
-from contextlib import asynccontextmanager
 
 import httpx
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_context
+from fastmcp.server.lifespan import lifespan
 
 
-def _get_api_keys() -> list[str]:
-    """Read API keys from HEALTHCHECKS_API_KEYS (comma-sep) or HEALTHCHECKS_API_KEY."""
+def _parse_keys() -> list[tuple[str, str]]:
+    """Parse API keys with optional project names.
+
+    Supports two formats:
+      HEALTHCHECKS_API_KEYS=key1:Project A,key2:Project B,key3:Project C
+      HEALTHCHECKS_API_KEY=single_key  (no project name)
+
+    Returns list of (key, project_name) tuples.
+    """
     keys_str = os.environ.get("HEALTHCHECKS_API_KEYS", "")
     if keys_str:
-        return [k.strip() for k in keys_str.split(",") if k.strip()]
+        result = []
+        for entry in keys_str.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if ":" in entry:
+                key, name = entry.split(":", 1)
+                result.append((key.strip(), name.strip()))
+            else:
+                result.append((entry, ""))
+        return result
     single = os.environ.get("HEALTHCHECKS_API_KEY", "")
-    return [single] if single else []
+    return [(single, "")] if single else []
 
 
 def create_healthchecks_server(name: str, prefix: str) -> FastMCP:
@@ -23,21 +40,21 @@ def create_healthchecks_server(name: str, prefix: str) -> FastMCP:
     Reads HEALTHCHECKS_URL and HEALTHCHECKS_API_KEYS (or HEALTHCHECKS_API_KEY) from env.
     """
     hc_url = os.environ.get("HEALTHCHECKS_URL", "https://hc.mees.st")
-    api_keys = _get_api_keys()
+    key_pairs = _parse_keys()
 
-    @asynccontextmanager
+    @lifespan
     async def hc_lifespan(server):
         clients = [
-            httpx.AsyncClient(headers={"X-Api-Key": key}, timeout=15.0)
-            for key in api_keys
+            (httpx.AsyncClient(headers={"X-Api-Key": key}, timeout=15.0), project)
+            for key, project in key_pairs
         ]
         yield {"clients": clients}
-        for c in clients:
+        for c, _ in clients:
             await c.aclose()
 
     mcp = FastMCP(name, lifespan=hc_lifespan)
 
-    def _clients() -> list[httpx.AsyncClient]:
+    def _clients() -> list[tuple[httpx.AsyncClient, str]]:
         return get_context().lifespan_context["clients"]
 
     def _status_icon(status: str) -> str:
@@ -53,15 +70,21 @@ def create_healthchecks_server(name: str, prefix: str) -> FastMCP:
         if tag:
             params["tag"] = tag
 
-        for client in _clients():
+        for client, project in _clients():
             resp = await client.get(f"{hc_url}/api/v3/checks/", params=params)
             resp.raise_for_status()
             for c in resp.json().get("checks", []):
                 uid = c.get("uuid", "")
                 if uid not in seen:
                     seen.add(uid)
+                    if project:
+                        c["_project"] = project
                     all_checks.append(c)
         return all_checks
+
+    def _project_label(c: dict) -> str:
+        p = c.get("_project", "")
+        return f" [{p}]" if p else ""
 
     @mcp.tool(name=f"{prefix}_list_checks")
     async def list_checks(
@@ -83,7 +106,7 @@ def create_healthchecks_server(name: str, prefix: str) -> FastMCP:
             return "No checks found."
 
         order = {"down": 0, "grace": 1, "new": 2, "paused": 3, "up": 4}
-        checks.sort(key=lambda c: (order.get(c.get("status", ""), 5), c.get("name", "")))
+        checks.sort(key=lambda c: (order.get(c.get("status", ""), 5), c.get("_project", ""), c.get("name", "")))
 
         lines = [f"Healthchecks ({len(checks)}):\n"]
         for c in checks:
@@ -94,9 +117,10 @@ def create_healthchecks_server(name: str, prefix: str) -> FastMCP:
             tags = ", ".join(c.get("tags", "").split()) if c.get("tags") else ""
             dur = c.get("last_duration")
             dur_str = f" ({dur}s)" if dur else ""
+            proj = _project_label(c)
 
             lines.append(
-                f"  [{st:6s}] {c['name']}{dur_str}\n"
+                f"  [{st:6s}] {c['name']}{dur_str}{proj}\n"
                 f"           Last ping: {last} | Tags: {tags or '—'}"
             )
 
@@ -120,9 +144,11 @@ def create_healthchecks_server(name: str, prefix: str) -> FastMCP:
         lines = []
         for c in matches:
             st = _status_icon(c.get("status", "?"))
+            proj = c.get("_project", "—")
             lines.append(
                 f"# {c['name']}\n\n"
                 f"**Status:** {st}\n"
+                f"**Project:** {proj}\n"
                 f"**UUID:** {c.get('uuid', '—')}\n"
                 f"**Tags:** {c.get('tags', '—')}\n"
                 f"**Schedule:** {c.get('schedule', '—')} ({c.get('tz', 'UTC')})\n"
@@ -152,9 +178,10 @@ def create_healthchecks_server(name: str, prefix: str) -> FastMCP:
             if last and last != "never":
                 last = last[:19].replace("T", " ")
             schedule = c.get("schedule", "—")
+            proj = _project_label(c)
 
             lines.append(
-                f"  [{st:6s}] {c['name']}\n"
+                f"  [{st:6s}] {c['name']}{proj}\n"
                 f"           Last ping: {last} | Schedule: {schedule}\n"
                 f"           Expected: {c.get('next_ping', '—')}"
             )
@@ -182,7 +209,7 @@ def create_healthchecks_server(name: str, prefix: str) -> FastMCP:
 
         # Find the client that has this check (try each until we get pings)
         pings = []
-        for client in _clients():
+        for client, _ in _clients():
             resp = await client.get(f"{hc_url}/api/v3/checks/{uuid}/pings/")
             if resp.status_code == 200:
                 pings = resp.json().get("pings", [])[:limit]
