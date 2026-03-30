@@ -1,11 +1,12 @@
 """Shared factory for Healthchecks MCP servers with multi-project support."""
 
+import logging
 import os
 
 import httpx
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import get_context
-from fastmcp.server.lifespan import lifespan
+
+log = logging.getLogger(__name__)
 
 
 def _parse_keys() -> list[tuple[str, str]]:
@@ -42,20 +43,9 @@ def create_healthchecks_server(name: str, prefix: str) -> FastMCP:
     hc_url = os.environ.get("HEALTHCHECKS_URL", "https://hc.mees.st")
     key_pairs = _parse_keys()
 
-    @lifespan
-    async def hc_lifespan(server):
-        clients = [
-            (httpx.AsyncClient(headers={"X-Api-Key": key}, timeout=15.0), project)
-            for key, project in key_pairs
-        ]
-        yield {"clients": clients}
-        for c, _ in clients:
-            await c.aclose()
+    log.info("%s: %d API key(s) configured for %s", name, len(key_pairs), hc_url)
 
-    mcp = FastMCP(name, lifespan=hc_lifespan)
-
-    def _clients() -> list[tuple[httpx.AsyncClient, str]]:
-        return get_context().lifespan_context["clients"]
+    mcp = FastMCP(name)
 
     def _status_icon(status: str) -> str:
         return {"up": "UP", "down": "DOWN", "grace": "GRACE", "paused": "PAUSED", "new": "NEW"}.get(
@@ -70,17 +60,34 @@ def create_healthchecks_server(name: str, prefix: str) -> FastMCP:
         if tag:
             params["tag"] = tag
 
-        for client, project in _clients():
-            resp = await client.get(f"{hc_url}/api/v3/checks/", params=params)
-            resp.raise_for_status()
-            for c in resp.json().get("checks", []):
-                uid = c.get("uuid", "")
-                if uid not in seen:
-                    seen.add(uid)
-                    if project:
-                        c["_project"] = project
-                    all_checks.append(c)
+        for key, project in key_pairs:
+            try:
+                async with httpx.AsyncClient(
+                    headers={"X-Api-Key": key}, timeout=15.0,
+                ) as client:
+                    resp = await client.get(f"{hc_url}/api/v3/checks/", params=params)
+                    resp.raise_for_status()
+                    checks = resp.json().get("checks", [])
+                    log.info("Project %r: %d checks", project or key[:10], len(checks))
+                    for c in checks:
+                        uid = c.get("uuid") or c.get("unique_key", "")
+                        if uid not in seen:
+                            seen.add(uid)
+                            if project:
+                                c["_project"] = project
+                            all_checks.append(c)
+            except Exception:
+                log.exception("Failed to fetch checks for project %r", project or key[:10])
+
+        log.info("Total: %d checks across %d projects", len(all_checks), len(key_pairs))
         return all_checks
+
+    async def _find_check_uuid(name_query: str) -> tuple[str | None, dict | None]:
+        """Find a check by name and return (uuid, check_dict)."""
+        checks = await _fetch_all_checks()
+        name_lower = name_query.lower()
+        matches = [c for c in checks if name_lower in c.get("name", "").lower()]
+        return (None, None) if not matches else (matches[0].get("uuid"), matches[0])
 
     def _project_label(c: dict) -> str:
         p = c.get("_project", "")
@@ -149,7 +156,7 @@ def create_healthchecks_server(name: str, prefix: str) -> FastMCP:
                 f"# {c['name']}\n\n"
                 f"**Status:** {st}\n"
                 f"**Project:** {proj}\n"
-                f"**UUID:** {c.get('uuid', '—')}\n"
+                f"**ID:** {c.get('uuid') or c.get('unique_key', '—')}\n"
                 f"**Tags:** {c.get('tags', '—')}\n"
                 f"**Schedule:** {c.get('schedule', '—')} ({c.get('tz', 'UTC')})\n"
                 f"**Grace period:** {c.get('grace', '—')}s\n"
@@ -207,14 +214,26 @@ def create_healthchecks_server(name: str, prefix: str) -> FastMCP:
         check = matches[0]
         uuid = check.get("uuid")
 
-        # Find the client that has this check (try each until we get pings)
+        if not uuid:
+            return (
+                f"Ping history is not available for '{check['name']}' — "
+                f"read-only API keys do not expose check UUIDs required by the pings endpoint."
+            )
+
+        # Try each key until we find the one that owns this check
         pings = []
-        for client, _ in _clients():
-            resp = await client.get(f"{hc_url}/api/v3/checks/{uuid}/pings/")
-            if resp.status_code == 200:
-                pings = resp.json().get("pings", [])[:limit]
-                if pings:
-                    break
+        for key, _ in key_pairs:
+            try:
+                async with httpx.AsyncClient(
+                    headers={"X-Api-Key": key}, timeout=15.0,
+                ) as client:
+                    resp = await client.get(f"{hc_url}/api/v3/checks/{uuid}/pings/")
+                    if resp.status_code == 200:
+                        pings = resp.json().get("pings", [])[:limit]
+                        if pings:
+                            break
+            except Exception:
+                continue
 
         if not pings:
             return f"No ping history for '{check['name']}'."
