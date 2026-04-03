@@ -351,8 +351,8 @@ async def plex_playlists(
     """Manage Plex playlists.
 
     Args:
-        action: 'list', 'view', 'create', 'add_items', 'remove_items'.
-        playlist_id: Playlist rating key (required for view, add_items, remove_items).
+        action: 'list', 'view', 'create', 'rename', 'delete', 'add_items', 'remove_items'.
+        playlist_id: Playlist rating key (required for view, rename, delete, add_items, remove_items).
         title: Playlist title (required for create).
         playlist_type: Type for create — 'video' or 'audio' (default 'video').
         rating_keys: List of item rating keys (for create, add_items, remove_items).
@@ -376,13 +376,35 @@ async def plex_playlists(
             machine_id = await _get_machine_id()
             params: dict = {"type": playlist_type, "title": title}
             if rating_keys:
-                uris = ",".join(_item_uri(rk, machine_id) for rk in rating_keys)
-                params["uri"] = uris
+                # Plex only accepts one URI per request — create with the first item
+                params["uri"] = _item_uri(rating_keys[0], machine_id)
             data = await _plex_post("/playlists", params=params)
             items = data.get("Metadata", [])
+            if items and rating_keys and len(rating_keys) > 1:
+                # Add remaining items one by one
+                pid = items[0]["ratingKey"]
+                for rk in rating_keys[1:]:
+                    await _plex_put(
+                        f"/playlists/{pid}/items",
+                        params={"uri": _item_uri(rk, machine_id)},
+                    )
             if items:
                 return json.dumps(_fmt_item(items[0]), indent=2)
             return "Playlist created."
+
+        case "rename":
+            if not playlist_id:
+                return "playlist_id is required for 'rename' action."
+            if not title:
+                return "title is required for 'rename' action."
+            await _plex_put(f"/playlists/{playlist_id}", params={"title": title})
+            return f"Playlist renamed to '{title}'."
+
+        case "delete":
+            if not playlist_id:
+                return "playlist_id is required for 'delete' action."
+            await _plex_delete(f"/playlists/{playlist_id}")
+            return f"Playlist {playlist_id} deleted."
 
         case "add_items":
             if not playlist_id:
@@ -390,8 +412,12 @@ async def plex_playlists(
             if not rating_keys:
                 return "rating_keys is required for 'add_items' action."
             machine_id = await _get_machine_id()
-            uris = ",".join(_item_uri(rk, machine_id) for rk in rating_keys)
-            await _plex_put(f"/playlists/{playlist_id}/items", params={"uri": uris})
+            # Plex only accepts one URI per request
+            for rk in rating_keys:
+                await _plex_put(
+                    f"/playlists/{playlist_id}/items",
+                    params={"uri": _item_uri(rk, machine_id)},
+                )
             return f"Added {len(rating_keys)} item(s) to playlist."
 
         case "remove_items":
@@ -405,7 +431,7 @@ async def plex_playlists(
             return f"Removed {len(rating_keys)} item(s) from playlist."
 
         case _:
-            return f"Unknown action: {action}. Use 'list', 'view', 'create', 'add_items', or 'remove_items'."
+            return f"Unknown action: {action}. Use 'list', 'view', 'create', 'rename', 'delete', 'add_items', or 'remove_items'."
 
 
 if __name__ == "__main__":
