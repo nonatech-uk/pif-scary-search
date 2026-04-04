@@ -7,7 +7,7 @@ import asyncpg
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_context
 
-DATABASES = ("finance", "mylocation", "scrobble", "pipeline", "wine", "homeassistant", "journal", "joplin", "paperless", "linkwarden", "splitwise", "obligations")
+DATABASES = ("finance", "mylocation", "scrobble", "pipeline", "wine", "homeassistant", "journal", "joplin", "paperless", "linkwarden", "splitwise", "obligations", "usage")
 DML_PATTERN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|COPY)\b",
     re.IGNORECASE,
