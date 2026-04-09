@@ -1,0 +1,35 @@
+Analyse this photo. The following metadata is GROUND TRUTH — incorporate it directly; do not contradict it:
+
+{metadata_json}
+
+Respond with ONLY valid JSON, no preamble:
+{
+  "description":     "2-3 sentences incorporating known people/location/album context",
+  "visual_tags":     [],
+  "objects":         [],
+  "scene_type":      "",
+  "people_count":    0,
+  "people_desc":     "",
+  "activities":      [],
+  "text_content":    "",
+  "dominant_colors": [],
+  "mood":            "",
+  "time_of_day":     "",
+  "season_hint":     "",
+  "location_hints":  []
+}
+
+Rules:
+- visual_tags: max 20 concrete visual tags. Exclude what metadata already covers (e.g. if city is "London", don't tag "london").
+- objects: physical objects visible in the image.
+- scene_type: exactly one of indoor|outdoor|urban|nature|transport|food|event.
+- people_count: total visible people (named + unnamed).
+- people_desc: visual description of unnamed faces only; null if all people are named.
+- activities: what people or animals are doing (e.g. "skiing", "eating", "reading").
+- text_content: any readable text (OCR). null if none.
+- dominant_colors: max 3 colours.
+- mood: exactly one of calm|joyful|dramatic|melancholic|busy|intimate|formal.
+- time_of_day: exactly one of morning|midday|afternoon|golden_hour|dusk|night|unknown.
+- season_hint: exactly one of spring|summer|autumn|winter|unknown.
+- location_hints: visual environment clues (e.g. "alpine", "ski resort", "beach"). Omit if city/country already confirmed in metadata.
+- description: weave known people names, location, and album context naturally into 2-3 sentences. Describe what is happening, not just what is visible.
