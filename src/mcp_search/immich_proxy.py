@@ -77,7 +77,7 @@ async def smart_search(request: Request) -> JSONResponse:
             json={
                 "query": pif_query,
                 "synthesize": False,
-                "limit": size * 3,  # over-fetch since we filter non-photo results
+                "limit": min(size * 3, 100),  # over-fetch but cap at PIF's max
             },
         )
         pif_resp.raise_for_status()
