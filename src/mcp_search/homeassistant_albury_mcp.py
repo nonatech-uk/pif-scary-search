@@ -1,12 +1,12 @@
-"""MCP server for the main (NAS) Home Assistant instance."""
+"""MCP server for the Albury Hall Home Assistant instance."""
 
 from mcp_search.homeassistant_base import create_homeassistant_server
 
 mcp = create_homeassistant_server(
-    "homeassistant",
-    "ha_mees",
-    url_env="HA_URL",
-    token_env="HA_TOKEN",
+    "homeassistant-albury",
+    "ha_albury",
+    url_env="HA_ALBURY_URL",
+    token_env="HA_ALBURY_TOKEN",
 )
 
 

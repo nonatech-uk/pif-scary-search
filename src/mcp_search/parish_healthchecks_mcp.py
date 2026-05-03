@@ -2,7 +2,7 @@
 
 from mcp_search.healthchecks_base import create_healthchecks_server
 
-mcp = create_healthchecks_server("parish-healthchecks", "parish_hc")
+mcp = create_healthchecks_server("parish-healthchecks", "hc_albury")
 
 if __name__ == "__main__":
     from mcp_search.run import serve
