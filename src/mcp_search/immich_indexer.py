@@ -142,11 +142,28 @@ def build_prompt(meta: dict) -> str:
 
 def parse_claude_json(text: str) -> dict | None:
     """Parse JSON from Claude response, stripping markdown fences if present."""
+    import re
     text = text.strip()
+    # Strip markdown heading preamble (e.g. "# Photo Description\n\n")
+    text = re.sub(r"^#+\s*[A-Za-z ]*Description\s*\n+", "", text)
+    # Strip markdown fences
     if text.startswith("```"):
         lines = text.split("\n")
         lines = [line for line in lines if not line.strip().startswith("```")]
-        text = "\n".join(lines)
+        text = "\n".join(lines).strip()
+    # Try to extract JSON object from mixed content
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        try:
+            result = json.loads(m.group())
+            # Clean description field of markdown noise
+            if "description" in result and isinstance(result["description"], str):
+                result["description"] = re.sub(
+                    r"^#+\s*[A-Za-z ]*[Dd]escription\s*\n+", "", result["description"]
+                ).strip().rstrip("`").strip()
+            return result
+        except json.JSONDecodeError:
+            pass
     try:
         return json.loads(text)
     except json.JSONDecodeError:
