@@ -689,6 +689,221 @@ async def build_irish_sea_ferry(
     }
 
 
+# Swiss airports + their on-site SBB stations.
+# (lat, lon, IATA, SBB station name).
+_SWISS_AIRPORTS = [
+    (46.238, 6.108, "GVA", "Genève-Aéroport"),
+    (47.464, 8.549, "ZRH", "Zürich Flughafen"),
+    (47.590, 7.529, "BSL", "Basel SBB"),  # 15-min shuttle from EuroAirport
+]
+
+
+def _pick_swiss_airport(dest: dict) -> tuple[str, str, float]:
+    """Closest Swiss airport to dest by haversine. Returns (IATA, SBB station name, dist_km)."""
+    import math
+    lat, lon = dest["lat"], dest["lon"]
+    best = None
+    for alat, alon, iata, station in _SWISS_AIRPORTS:
+        # Cheap haversine — good enough for ranking
+        dlat = math.radians(lat - alat)
+        dlon = math.radians(lon - alon)
+        a = (math.sin(dlat/2)**2 +
+             math.cos(math.radians(alat)) * math.cos(math.radians(lat)) *
+             math.sin(dlon/2)**2)
+        d = 6371 * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        if best is None or d < best[2]:
+            best = (iata, station, d)
+    return best
+
+
+async def _sbb_first_connection(
+    client, from_station: str, to_query: str, dt: datetime, max_journeys: int = 3,
+) -> dict | None:
+    """Query transport.opendata.ch for the first sensible connection.
+    Returns a normalised dict {duration_minutes, transfers, products, sections}."""
+    try:
+        resp = await client.get(
+            "http://transport.opendata.ch/v1/connections",
+            params={
+                "from": from_station, "to": to_query,
+                "date": dt.strftime("%Y-%m-%d"),
+                "time": dt.strftime("%H:%M"),
+                "limit": max_journeys,
+            },
+            timeout=20.0,
+        )
+        if resp.status_code >= 400:
+            return None
+        data = resp.json()
+        conns = data.get("connections") or []
+        if not conns:
+            return None
+        first = conns[0]
+        # SBB returns duration as 'D:HH:MM:SS' — convert to minutes.
+        dur = first.get("duration") or "0:00:00:00"
+        parts = dur.split(":")
+        if len(parts) == 4:
+            days, hours, mins = int(parts[0]), int(parts[1]), int(parts[2])
+            total_min = days * 1440 + hours * 60 + mins
+        else:
+            total_min = None
+        return {
+            "duration_minutes": total_min,
+            "transfers": first.get("transfers", 0),
+            "products": first.get("products") or [],
+            "departure": (first.get("from") or {}).get("departure", ""),
+            "arrival": (first.get("to") or {}).get("arrival", ""),
+            "from": (first.get("from") or {}).get("station", {}).get("name"),
+            "to": (first.get("to") or {}).get("station", {}).get("name"),
+            "sections": [
+                {
+                    "category": (s.get("journey") or {}).get("category", "walk" if s.get("walk") else "?"),
+                    "from": (s.get("departure") or {}).get("station", {}).get("name", ""),
+                    "to": (s.get("arrival") or {}).get("station", {}).get("name", ""),
+                }
+                for s in first.get("sections") or []
+            ],
+        }
+    except (httpx.HTTPError, Exception):
+        return None
+
+
+async def build_fly_train(
+    ctx, region: str, dest: dict, depart_dt: datetime,
+    origin: str = ORIGIN_HOME_DEFAULT, origin_label: str = ORIGIN_HOME_LABEL_DEFAULT,
+    prefer_carriers: list[str] | None = None,
+    exclude_carriers: list[str] | None = None,
+) -> dict[str, Any]:
+    """Drive to UK airport → fly to nearest Swiss airport → SBB+PostBus
+    to destination. The Swiss-end leg is composed via SBB's full
+    integrated planner (transport.opendata.ch), so it routes ANY Swiss
+    public-transport-served destination — including PostBus to mountain
+    villages (Grimentz, Verbier, etc.), cable cars, and the famous
+    Wengernalpbahn-style mountain trains.
+
+    Beats fly_geneva_drive on time-cost for car-free destinations
+    (Zermatt, Wengen, Mürren) and on total cost everywhere given Swiss
+    hire car prices (£100-150/day) + restrictive parking.
+    """
+    apt_iata, apt_station, apt_dist_km = _pick_swiss_airport(dest)
+
+    # Drive home → origin UK airport (LGW)
+    origin_airports = ["LGW", "LHR"]
+    origin_iata = origin_airports[0]
+    drive_to_apt = await _drive_or_fallback(
+        ctx["client"], origin, f"{origin_iata} airport",
+        _to_iso_z(depart_dt), fallback_min=50,
+    )
+    drive_min_uk = int(round(drive_to_apt["duration_minutes"]))
+
+    # Flight LGW → Swiss airport
+    flight_depart = depart_dt + timedelta(minutes=drive_min_uk + AIRPORT_OVERHEAD_MIN)
+    try:
+        offers = await search_offers(
+            ctx["client"], origin_iata, apt_iata,
+            flight_depart.strftime("%Y-%m-%d"),
+            adults=2,
+            prefer_carriers=prefer_carriers,
+            exclude_carriers=exclude_carriers,
+        )
+    except DuffelError as e:
+        return {"ok": False, "mode": "fly_train",
+                "error": f"flight lookup failed: {type(e).__name__}: {str(e)[:200]}"}
+
+    if not offers.get("offers"):
+        return {"ok": False, "mode": "fly_train",
+                "error": f"no Duffel offers {origin_iata}→{apt_iata}"}
+
+    cheapest = offers["offers"][0]
+    sl = (cheapest.get("slices") or [{}])[0]
+    flight_min = sl.get("elapsed_minutes") or 120
+    flight_price = cheapest.get("total_amount")
+    flight_currency = cheapest.get("total_currency", "GBP")
+    flight_carrier = cheapest.get("owner") or "?"
+    flight_depart_iso = sl.get("depart")
+    flight_arrive_iso = sl.get("arrive")
+
+    # Compute when we'll be at the airport SBB station
+    # (30 min disembark + walk to SBB platform; +15 for BSL shuttle)
+    apt_to_sbb_min = 45 if apt_iata == "BSL" else 30
+    sbb_ready = depart_dt + timedelta(
+        minutes=drive_min_uk + AIRPORT_OVERHEAD_MIN + flight_min + apt_to_sbb_min,
+    )
+
+    # SBB+PostBus from airport to destination — use city/village name
+    # if we have one, else lat,lon. Coords are accepted by the API but
+    # named stations route more cleanly through the timetable.
+    dest_query = dest.get("display_name", "").split(",")[0].strip() or f"{dest['lat']},{dest['lon']}"
+    transit = await _sbb_first_connection(ctx["client"], apt_station, dest_query, sbb_ready)
+
+    if not transit:
+        return {"ok": False, "mode": "fly_train",
+                "error": f"SBB returned no connection {apt_station} → {dest_query}"}
+
+    transit_min = transit["duration_minutes"] or 180
+
+    door_to_door = drive_min_uk + AIRPORT_OVERHEAD_MIN + flight_min + apt_to_sbb_min + transit_min
+
+    legs = [
+        {"kind": "drive", "from": origin_label, "to": f"{origin_iata} airport",
+         "minutes": drive_min_uk, "operator": "self-drive",
+         "note": f"{drive_to_apt.get('distance_km','?')} km"
+                 + (" (live traffic)" if not drive_to_apt.get("fallback") else " (static estimate)")},
+        {"kind": "wait", "from": f"{origin_iata} airport", "to": f"{origin_iata} airport",
+         "minutes": AIRPORT_OVERHEAD_MIN,
+         "note": "Check-in + security + walk to gate"},
+        {"kind": "flight", "from": origin_iata, "to": apt_iata,
+         "minutes": flight_min, "operator": flight_carrier,
+         "depart": flight_depart_iso, "arrive": flight_arrive_iso,
+         "booking_url": offers.get("booking_deeplink"),
+         "note": f"{flight_currency} {flight_price} (cheapest of {len(offers['offers'])} offers)"},
+        {"kind": "wait", "from": f"{apt_iata} airport", "to": f"{apt_station}",
+         "minutes": apt_to_sbb_min,
+         "note": "Disembark + baggage + walk to airport SBB station"
+                 + (" (15-min shuttle to Basel SBB)" if apt_iata == "BSL" else "")},
+        {"kind": "train", "from": apt_station, "to": transit.get("to") or dest_query,
+         "minutes": transit_min, "operator": "SBB+PostBus",
+         "depart": transit.get("departure"),
+         "arrive": transit.get("arrival"),
+         "transfers": transit.get("transfers"),
+         "products": transit.get("products"),
+         "note": (
+             f"{transit['transfers']} transfers via {','.join(transit.get('products') or [])}"
+         )},
+    ]
+
+    return {
+        "ok": True,
+        "mode": "fly_train",
+        "door_to_door_minutes": door_to_door,
+        "transfers": (transit.get("transfers") or 0) + 1,   # flight counts as 1 transfer
+        "legs": legs,
+        "total_cost_gbp": (
+            flight_price if flight_currency == "GBP" and flight_price is not None else None
+        ),
+        "data_sources": [
+            "duffel-live" if offers.get("live") else "duffel-test",
+            "sbb-live",
+            "google-maps" if not drive_to_apt.get("fallback") else "static-fallback",
+        ],
+        "booking_urls": [offers.get("booking_deeplink")],
+        "trade_offs": [
+            f"Fly LGW→{apt_iata}, then SBB+PostBus into Switzerland.",
+            f"No hire car needed — Swiss public transport reaches every "
+            f"village including {transit.get('to') or dest_query} via "
+            f"{','.join(transit.get('products') or [])}.",
+            f"Cheaper than hire-car alternative (~£100-150/day saved).",
+            *([f"Climate-friendly + scenic — {','.join(transit.get('products') or [])} through the Alps."]
+              if any('B' in p or 'IR' in p for p in transit.get('products') or []) else []),
+        ],
+        "summary": (
+            f"Fly LGW→{apt_iata} ({flight_min} min) + SBB {apt_station}→"
+            f"{transit.get('to') or dest_query} ({transit_min} min): "
+            f"{door_to_door} min door-to-door, {flight_currency} {flight_price}."
+        ),
+    }
+
+
 async def build_north_sea_ferry(
     ctx, dest: dict, depart_dt: datetime,
     origin: str = ORIGIN_HOME_DEFAULT, origin_label: str = ORIGIN_HOME_LABEL_DEFAULT,
