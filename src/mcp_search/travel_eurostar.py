@@ -1,19 +1,61 @@
-"""Eurostar — city-pair durations + booking deeplink.
+"""Eurostar — live journey timetable + per-class seat availability.
 
-Eurostar publishes a stable city-pair timetable: London ↔ Paris is always
-~2h16, regardless of date or fare class. For trip planning we return the
-travel time + check-in overhead at St Pancras, plus a booking URL that
-takes the user to live availability.
+Calls the same GraphQL endpoint Eurostar's website uses
+(`site-api.eurostar.com/gateway`, `JourneySearch` operation). Returns
+every train running on the date, with departure / arrival times, total
+journey duration in minutes, and per-class seat counts (Standard,
+Standard Premier, Business Premier).
 
-Originally implemented as a Playwright scraper; replaced with static
-durations 2026-05-03 after the Eurostar SPA proved hostile to scraping
-and the brief was always about door-to-door comparison. Time data is
-public; pricing comes from the operator at click-through time.
+Endpoint discovered by Stu via the site's XHR traffic; reference script
+at /zfs/tank/home/stu/eurostar.py. No auth, no scraping, no Playwright.
+
+Falls back to the static city-pair durations table (kept below) if the
+GraphQL endpoint errors. Pricing is not exposed by this endpoint —
+booking_url goes to the live booking flow for the chosen train.
 """
 
-from datetime import date as date_type, datetime
+from datetime import date as date_type, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
+
+import httpx
+
+GRAPHQL_URL = "https://site-api.eurostar.com/gateway"
+_GQL_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Origin": "https://www.eurostar.com",
+    "Referer": "https://www.eurostar.com/uk-en/train-search",
+    "x-platform": "web",
+    "x-market-code": "uk",
+}
+
+_JOURNEY_QUERY = """
+query JourneySearch(
+  $origin: String!
+  $destination: String!
+  $outboundDate: String!
+  $adults: Int
+) {
+  journeySearch(
+    origin: $origin
+    destination: $destination
+    outboundDate: $outboundDate
+    adults: $adults
+  ) {
+    outbound {
+      journeys {
+        timing { departs arrives duration departureDate }
+        fares  { class { name code } seats }
+      }
+    }
+  }
+}
+"""
 
 # UIC station codes — used for booking deeplinks (Eurostar accepts them
 # in some flows; mostly here as a stable identifier for our data table).
@@ -101,12 +143,100 @@ def _booking_url(o_code: str, d_code: str, date: str, adults: int) -> str:
     return f"https://www.eurostar.com/uk-en/book?{qs}"
 
 
+async def _fetch_journeys(
+    client: httpx.AsyncClient,
+    origin_uic: str,
+    dest_uic: str,
+    date: str,
+    adults: int,
+) -> list[dict[str, Any]]:
+    payload = {
+        "operationName": "JourneySearch",
+        "variables": {
+            "origin": origin_uic,
+            "destination": dest_uic,
+            "outboundDate": date,
+            "adults": adults,
+        },
+        "query": _JOURNEY_QUERY,
+    }
+    resp = await client.post(
+        GRAPHQL_URL, json=payload, headers=_GQL_HEADERS, timeout=20.0,
+    )
+    if resp.status_code >= 400:
+        raise EurostarError(f"eurostar graphql {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    if data.get("errors"):
+        raise EurostarError(f"eurostar graphql errors: {data['errors']}")
+    raw = (
+        (data.get("data") or {})
+        .get("journeySearch", {})
+        .get("outbound", {})
+        .get("journeys", []) or []
+    )
+    out: list[dict[str, Any]] = []
+    for j in raw:
+        t = j.get("timing") or {}
+        fares = []
+        any_seats = 0
+        for f in j.get("fares") or []:
+            seats = f.get("seats")
+            if seats is None:
+                continue
+            cls = f.get("class") or {}
+            fares.append({
+                "class_name": cls.get("name"),
+                "class_code": cls.get("code"),
+                "seats": seats,
+                "available": seats > 0,
+            })
+            any_seats = max(any_seats, seats)
+        out.append({
+            "departure": t.get("departs"),
+            "arrival": t.get("arrives"),
+            "duration_minutes": t.get("duration"),
+            "date": t.get("departureDate") or date,
+            "fares": fares,
+            "available": any_seats > 0,
+        })
+    out.sort(key=lambda x: (x.get("departure") or ""))
+    return out
+
+
+def _hhmm_to_minutes(s: str | None) -> int | None:
+    if not s or len(s) < 4:
+        return None
+    try:
+        h, m = s.split(":", 1)
+        return int(h) * 60 + int(m)
+    except ValueError:
+        return None
+
+
+def _pick_nearest_journey(
+    journeys: list[dict[str, Any]], target_time: str,
+) -> dict[str, Any] | None:
+    if not journeys:
+        return None
+    target = _hhmm_to_minutes(target_time) or _hhmm_to_minutes("10:00") or 600
+    available = [j for j in journeys if j.get("available")]
+    pool = available or journeys
+    after = [j for j in pool if (m := _hhmm_to_minutes(j.get("departure"))) is not None and m >= target]
+    if after:
+        return after[0]
+    return min(
+        pool,
+        key=lambda j: abs((_hhmm_to_minutes(j.get("departure")) or 0) - target),
+    )
+
+
 async def check(
-    browser,            # kept for signature compatibility; unused
+    client: httpx.AsyncClient | None,
     origin_city: str,
     dest_city: str,
     date: str,
     adults: int = 2,
+    time: str = "10:00",
 ) -> dict[str, Any]:
     o = _resolve_station(origin_city)
     d = _resolve_station(dest_city)
@@ -116,9 +246,9 @@ async def check(
         raise EurostarError(f"invalid date {date!r}: {e}") from e
 
     pair = tuple(sorted([o["slug"], d["slug"]]))
-    direct = DIRECT_MINUTES.get(pair)
+    direct_static = DIRECT_MINUTES.get(pair)
 
-    result: dict[str, Any] = {
+    base: dict[str, Any] = {
         "ok": True,
         "mode": "eurostar",
         "from": o["name"],
@@ -126,31 +256,64 @@ async def check(
         "to": d["name"],
         "to_code": d["code"],
         "date": date,
+        "time": time,
         "adults": adults,
-        "source": "static-timetable",
-        "data_sources": ["static-table"],
         "checkin_minutes": ST_PANCRAS_CHECKIN_MIN if o["country"] == "GB" else 30,
         "default_drive_to_st_pancras_min": DEFAULT_DRIVE_TO_ST_PANCRAS,
         "booking_url": _booking_url(o["code"], d["code"], date, adults),
         "as_of": datetime.utcnow().isoformat() + "Z",
-        "note": (
-            "Time-only data; live availability and prices via booking_url. "
-            "Seasonal routes only run in their stated window."
-        ),
     }
 
-    if direct:
+    # Try live first
+    if client is not None:
+        try:
+            journeys = await _fetch_journeys(client, o["code"], d["code"], date, adults)
+        except (EurostarError, httpx.HTTPError) as e:
+            journeys = None
+            base["live_error"] = str(e)
+    else:
+        journeys = None
+
+    if journeys is not None:
+        nearest = _pick_nearest_journey(journeys, time)
+        return {
+            **base,
+            "source": "eurostar-live",
+            "data_sources": ["eurostar-live"],
+            "direct": len(journeys) > 0,
+            "minutes": (nearest or {}).get("duration_minutes")
+                       or (direct_static and direct_static["minutes"]),
+            "selected_journey": nearest,
+            "journeys": journeys,
+            "journey_count": len(journeys),
+            "available_count": sum(1 for j in journeys if j.get("available")),
+            "note": (
+                "Live timetable + seat availability per class. Prices "
+                "are not exposed on this endpoint — booking_url for fares."
+            ),
+        }
+
+    # Static-table fallback
+    result = {
+        **base,
+        "source": "static-timetable",
+        "data_sources": ["static-table"],
+        "note": (
+            "Time-only data (live timetable unavailable). "
+            "Use booking_url for live availability and prices."
+        ),
+    }
+    if direct_static:
         result["direct"] = True
-        result["minutes"] = direct["minutes"]
-        result["frequency"] = direct["frequency"]
-        result["seasonal"] = direct["seasonal"]
+        result["minutes"] = direct_static["minutes"]
+        result["frequency"] = direct_static["frequency"]
+        result["seasonal"] = direct_static["seasonal"]
     else:
         result["direct"] = False
         result["minutes"] = None
         result["note"] = (
             f"No direct Eurostar between {o['name']} and {d['name']}. "
             "Connect via Lille Europe or Paris Gare du Nord; consult "
-            "sncf_journey for the onward TGV leg."
+            "travel_sncf_journey for the onward TGV leg."
         )
-
     return result

@@ -187,9 +187,10 @@ async def _sncf_impl(
 
 
 async def _eurostar_impl(
-    ctx: dict, origin_city: str, dest_city: str, date: str, adults: int
+    ctx: dict, origin_city: str, dest_city: str, date: str, adults: int,
+    time: str = "10:00",
 ) -> dict[str, Any]:
-    args = {"origin": origin_city, "dest": dest_city, "date": date, "adults": adults}
+    args = {"origin": origin_city, "dest": dest_city, "date": date, "adults": adults, "time": time}
     bucket = date_type.fromisoformat(date)
 
     cached = await cache_get(ctx["pool"], "eurostar_check", args, bucket)
@@ -198,7 +199,9 @@ async def _eurostar_impl(
         return cached
 
     try:
-        result = await eurostar_scrape(ctx.get("browser"), origin_city, dest_city, date, adults=adults)
+        result = await eurostar_scrape(
+            ctx.get("client"), origin_city, dest_city, date, adults=adults, time=time,
+        )
     except EurostarError as e:
         return {
             "ok": False,
@@ -209,7 +212,10 @@ async def _eurostar_impl(
             "date": date,
         }
 
-    await cache_set(ctx["pool"], "eurostar_check", args, bucket, result, _TTL_SCRAPER)
+    # Live timetables can shift seat availability hour-to-hour; cache
+    # those for 6h. Static-table fallback is stable, cache 24h.
+    ttl = 6 * 3600 if "eurostar-live" in (result.get("data_sources") or []) else _TTL_SCRAPER
+    await cache_set(ctx["pool"], "eurostar_check", args, bucket, result, ttl)
     result["cached"] = False
     return result
 
@@ -812,14 +818,31 @@ async def travel_eurostar_check(
     dest_city: str,
     date: str,
     adults: int = 2,
+    time: str = "10:00",
 ) -> str:
-    """Get the lowest GBP fare for a Eurostar route on a date (scraper).
+    """Live Eurostar timetable + per-class seat availability for a date.
 
-    Stations: 'london'/'ashford'/'ebbsfleet' → 'paris'/'lille'/'brussels'/
-    'amsterdam'/'rotterdam'/'disneyland'. Cache TTL 24h.
+    Calls the GraphQL endpoint Eurostar's site uses (`site-api.eurostar.com`).
+    Returns every train running on `date` plus per-class seat counts
+    (Standard, Standard Premier, Business Premier) and selects the train
+    nearest the requested `time`.
+
+    Stations: 'london' → 'paris' / 'brussels' / 'amsterdam' / 'rotterdam' /
+    'disneyland' / 'lille'. Pricing is not exposed on this endpoint;
+    booking_url goes to the live booking flow with the correct date.
+
+    Args:
+        origin_city: 'london' or another known slug.
+        dest_city: target station slug.
+        date: YYYY-MM-DD departure date.
+        adults: Pax count (affects fare-class availability filtering).
+        time: HH:MM target — selected_journey is the train at-or-after.
+
+    Live cache TTL 6h, static-table fallback 24h.
     """
     return json.dumps(
-        await _eurostar_impl(_ctx(), origin_city, dest_city, date, adults), indent=2
+        await _eurostar_impl(_ctx(), origin_city, dest_city, date, adults, time=time),
+        indent=2,
     )
 
 

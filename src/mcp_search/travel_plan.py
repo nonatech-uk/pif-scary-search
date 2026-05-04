@@ -180,7 +180,13 @@ async def build_eurostar(
     drive_min_uk = int(round(drive_to_stp["duration_minutes"]))
 
     es_dest = REGION_EUROSTAR.get(region, "paris")
-    es = await eurostar_check(None, "london", es_dest, depart_dt.strftime("%Y-%m-%d"), adults=2)
+    # Target time = arrive at St Pancras + 60-min buffer
+    arrive_stp = depart_dt + timedelta(minutes=drive_min_uk)
+    target_train_time = (arrive_stp + timedelta(minutes=PREDEPARTURE_BUFFER_MIN)).strftime("%H:%M")
+    es = await eurostar_check(
+        ctx["client"], "london", es_dest, depart_dt.strftime("%Y-%m-%d"),
+        adults=2, time=target_train_time,
+    )
 
     direct = es.get("direct", False)
     if not direct:
@@ -210,7 +216,20 @@ async def build_eurostar(
                 "trade_offs": ["Use the Paris/Lille interchange path (not yet implemented), or pick another mode."],
             }
 
-    train_min = es.get("minutes") or 180
+    es_live = "eurostar-live" in (es.get("data_sources") or [])
+    selected = es.get("selected_journey") or {}
+    train_min = selected.get("duration_minutes") or es.get("minutes") or 180
+    es_depart = selected.get("departure")
+    es_arrive = selected.get("arrival")
+
+    # Live fares (no prices, but seat counts + class names) bubble up
+    fare_summary = None
+    if es_live and selected.get("fares"):
+        avail = [f for f in selected["fares"] if f.get("available")]
+        fare_summary = ", ".join(
+            f"{f['class_name']} ({f['seats']})" for f in avail if f.get("class_name")
+        ) or "fully booked"
+
     # Final drive at destination (Eurostar arrival station → user's lat/lon)
     arrive_dest_station = depart_dt + timedelta(minutes=drive_min_uk + PREDEPARTURE_BUFFER_MIN + train_min)
     drive_dest = await _drive_or_fallback(
@@ -223,6 +242,15 @@ async def build_eurostar(
     drive_min_dest = int(round(drive_dest["duration_minutes"]))
 
     door_to_door = drive_min_uk + PREDEPARTURE_BUFFER_MIN + train_min + drive_min_dest
+
+    train_note = (
+        f"Booked train: {es_depart} → {es_arrive} ({train_min} min)"
+        if es_live and es_depart else
+        f"{es.get('frequency','?')}{(' — '+es['seasonal']) if es.get('seasonal') else ''}"
+    )
+    if fare_summary:
+        train_note += f". Seats: {fare_summary}"
+
     legs = [
         {"kind": "drive", "from": origin_label, "to": "St Pancras International",
          "minutes": drive_min_uk, "operator": "self-drive",
@@ -232,8 +260,10 @@ async def build_eurostar(
          "minutes": PREDEPARTURE_BUFFER_MIN, "note": "60-min pre-departure (security + customs)"},
         {"kind": "train", "from": "London St Pancras", "to": es.get("to"),
          "minutes": train_min, "operator": "Eurostar",
+         "depart": es_depart, "arrive": es_arrive,
          "booking_url": es.get("booking_url"),
-         "note": f"{es.get('frequency','?')}{(' — '+es['seasonal']) if es.get('seasonal') else ''}"},
+         "fares": selected.get("fares") if es_live else None,
+         "note": train_note},
         {"kind": "drive", "from": es.get("to"), "to": dest["display_name"],
          "minutes": drive_min_dest, "operator": "taxi/hire",
          "note": f"{drive_dest.get('distance_km','?')} km"
@@ -245,13 +275,17 @@ async def build_eurostar(
         "door_to_door_minutes": door_to_door,
         "transfers": 1,
         "legs": legs,
-        "data_sources": ["static-timetable",
-                         "google-maps" if not drive_to_stp.get("fallback") else "static-fallback",
-                         "google-maps" if not drive_dest.get("fallback") else "static-fallback"],
+        "data_sources": [
+            "eurostar-live" if es_live else "static-timetable",
+            "google-maps" if not drive_to_stp.get("fallback") else "static-fallback",
+            "google-maps" if not drive_dest.get("fallback") else "static-fallback",
+        ],
         "booking_urls": [es.get("booking_url")],
         "trade_offs": [
             f"Direct Eurostar — no airport hassle.",
             f"Taxi/hire at destination ({drive_min_dest} min) is the friction.",
+            *([f"Booked train: {es_depart} → {es_arrive}"] if es_live and es_depart else []),
+            *([f"Available classes: {fare_summary}"] if fare_summary else []),
             *(["Seasonal: " + es["seasonal"]] if es.get("seasonal") else []),
         ],
         "summary": f"Eurostar: {door_to_door} min door-to-door "
