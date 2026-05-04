@@ -234,6 +234,8 @@ async def build_flight(
     ctx, region: str, dest: dict, depart_dt: datetime, alps_geneva: bool = False,
     origin: str = ORIGIN_HOME_DEFAULT, origin_label: str = ORIGIN_HOME_LABEL_DEFAULT,
     dest_iata_override: str | None = None,
+    prefer_carriers: list[str] | None = None,
+    exclude_carriers: list[str] | None = None,
 ) -> dict[str, Any]:
     airports = REGION_AIRPORTS.get(region) or {"origin": ["LGW"], "destination": ["CDG"]}
     origin_iata = airports["origin"][0]
@@ -257,6 +259,8 @@ async def build_flight(
         offers = await search_offers(
             ctx["client"], origin_iata, dest_iata,
             depart_dt.strftime("%Y-%m-%d"), adults=2, cabin="economy",
+            prefer_carriers=prefer_carriers,
+            exclude_carriers=exclude_carriers,
         )
         cheapest = offers["offers"][0] if offers.get("offers") else None
         if not cheapest:
@@ -324,19 +328,32 @@ async def build_flight(
 
 
 def _parse_iso_duration_min(s: str) -> int:
-    """Parse 'PT2H5M' / 'PT45M' / 'PT3H' to minutes."""
-    if not s or not s.startswith("PT"):
+    """Parse ISO 8601 duration to minutes. Handles PT3H20M, P1DT11H35M, P2D etc."""
+    if not s or not s.startswith("P"):
         return 0
-    total = 0
+    rest = s[1:]
+    if "T" in rest:
+        date_part, time_part = rest.split("T", 1)
+    else:
+        date_part, time_part = rest, ""
+    days = 0
     cur = ""
-    for ch in s[2:]:
+    for ch in date_part:
+        if ch.isdigit():
+            cur += ch
+        elif ch == "D":
+            days = int(cur or "0")
+            cur = ""
+    total = days * 24 * 60
+    cur = ""
+    for ch in time_part:
         if ch.isdigit():
             cur += ch
         elif ch == "H":
-            total += int(cur) * 60
+            total += int(cur or "0") * 60
             cur = ""
         elif ch == "M":
-            total += int(cur)
+            total += int(cur or "0")
             cur = ""
     return total
 
@@ -437,6 +454,8 @@ async def plan_trip_impl(
     fly_only: bool = False, dest_airports: list[str] | None = None,
     overnight_near: str | None = None,
     prefer_affiliation: str | None = None,
+    prefer_carriers: list[str] | None = None,
+    exclude_carriers: list[str] | None = None,
 ) -> dict[str, Any]:
     origin = origin or ORIGIN_HOME_DEFAULT
     origin_label = origin_label or origin
@@ -482,11 +501,15 @@ async def plan_trip_impl(
                 tasks.append((f"flight_{ap}",
                               build_flight(ctx, region, geo, depart_dt, alps_geneva=False,
                                            origin=origin, origin_label=origin_label,
-                                           dest_iata_override=ap)))
+                                           dest_iata_override=ap,
+                                           prefer_carriers=prefer_carriers,
+                                           exclude_carriers=exclude_carriers)))
         elif m == "fly_geneva_drive":
             tasks.append(("fly_geneva_drive",
                           build_flight(ctx, region, geo, depart_dt, alps_geneva=True,
-                                       origin=origin, origin_label=origin_label)))
+                                       origin=origin, origin_label=origin_label,
+                                       prefer_carriers=prefer_carriers,
+                                       exclude_carriers=exclude_carriers)))
 
     # Optional multi-day-drive option triggered by overnight_near
     if overnight_near and not fly_only:

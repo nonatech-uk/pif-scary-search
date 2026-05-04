@@ -59,6 +59,35 @@ def _summarise_slice(slc: dict) -> dict:
     }
 
 
+def _carrier_matches(offer: dict, patterns: list[str]) -> bool:
+    """True if the offer's owner matches any pattern (IATA code OR name substring),
+    case-insensitive. Also checks per-segment marketing carriers so e.g.
+    'BA' matches a BA-codeshare flight even if owner is a partner."""
+    if not patterns:
+        return False
+    owner = offer.get("owner") or {}
+    name = (owner.get("name") or "").lower()
+    iata = (owner.get("iata_code") or "").lower()
+    seg_carriers: list[tuple[str, str]] = []
+    for slc in offer.get("slices") or []:
+        for seg in slc.get("segments") or []:
+            mc = seg.get("marketing_carrier") or {}
+            seg_carriers.append((
+                (mc.get("iata_code") or "").lower(),
+                (mc.get("name") or "").lower(),
+            ))
+    for p in patterns:
+        pl = p.strip().lower()
+        if not pl:
+            continue
+        if pl == iata or (name and pl in name):
+            return True
+        for (sc_iata, sc_name) in seg_carriers:
+            if pl == sc_iata or (sc_name and pl in sc_name):
+                return True
+    return False
+
+
 async def search_offers(
     client: httpx.AsyncClient,
     origin: str,
@@ -67,8 +96,17 @@ async def search_offers(
     adults: int = 2,
     cabin: str = "economy",
     max_offers: int = 5,
+    prefer_carriers: list[str] | None = None,
+    exclude_carriers: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Run a one-way offer request. Returns a summary dict, not raw Duffel JSON."""
+    """Run a one-way offer request. Returns a summary dict, not raw Duffel JSON.
+
+    Carrier filters (case-insensitive; match IATA code or name substring,
+    checks both `owner` and per-segment `marketing_carrier`):
+      - `exclude_carriers`: hard-drop matching offers (e.g. ["Ryanair","Wizz"])
+      - `prefer_carriers`: soft preference — matching offers move to the
+        top of the result, non-matching kept as fallback below
+    """
     body = {
         "data": {
             "slices": [
@@ -89,16 +127,32 @@ async def search_offers(
         raise DuffelError(f"duffel {resp.status_code}: {resp.text[:500]}")
     payload = resp.json().get("data", {})
     offers = payload.get("offers") or []
+
+    # Hard filter: drop excluded carriers
+    if exclude_carriers:
+        offers = [o for o in offers if not _carrier_matches(o, exclude_carriers)]
+
+    # Sort by price first
     offers.sort(key=lambda o: float(o.get("total_amount", "9999")))
+
+    # Soft preference: re-order so preferred carriers appear first (still
+    # price-sorted within each group)
+    if prefer_carriers:
+        preferred = [o for o in offers if _carrier_matches(o, prefer_carriers)]
+        others    = [o for o in offers if not _carrier_matches(o, prefer_carriers)]
+        offers = preferred + others
 
     results = []
     for o in offers[:max_offers]:
+        owner = o.get("owner") or {}
         results.append(
             {
                 "id": o.get("id"),
                 "total_amount": float(o["total_amount"]) if o.get("total_amount") else None,
                 "total_currency": o.get("total_currency"),
-                "owner": (o.get("owner") or {}).get("name"),
+                "owner": owner.get("name"),
+                "owner_iata": owner.get("iata_code"),
+                "preferred": _carrier_matches(o, prefer_carriers) if prefer_carriers else None,
                 "cabin_class": cabin,
                 "expires_at": o.get("expires_at"),
                 "slices": [_summarise_slice(s) for s in o.get("slices", [])],
@@ -114,6 +168,8 @@ async def search_offers(
         "adults": adults,
         "cabin": cabin,
         "live": os.environ.get("DUFFEL_MODE", "test") == "live",
+        "prefer_carriers": prefer_carriers,
+        "exclude_carriers": exclude_carriers,
         "offers": results,
         "booking_deeplink": _skyscanner_deeplink(origin, destination, date, adults, cabin),
     }

@@ -29,7 +29,12 @@ from mcp_search.travel_drive import DriveError, drive_time as drive_route
 from mcp_search.travel_duffel import DuffelError, search_offers
 from mcp_search.travel_eurostar import EurostarError, check as eurostar_scrape
 from mcp_search.travel_eurotunnel import EurotunnelError, check as eurotunnel_scrape
+from mcp_search.travel_ferries import (
+    FerryError, check as ferry_check, routes_to as ferry_routes_to,
+    ROUTES as FERRY_ROUTES,
+)
 from mcp_search.travel_hotels import search as hotels_search
+from mcp_search.travel_multi_leg import plan_multi_leg_impl
 from mcp_search.travel_plan import plan_trip_impl
 from mcp_search.travel_sncf import SncfError, search_journey as sncf_search
 
@@ -91,11 +96,18 @@ def _ctx():
 
 
 async def _flight_impl(
-    ctx: dict, origin_iata: str, dest_iata: str, date: str, cabin: str, adults: int
+    ctx: dict, origin_iata: str, dest_iata: str, date: str, cabin: str, adults: int,
+    prefer_carriers: list[str] | None = None,
+    exclude_carriers: list[str] | None = None,
 ) -> dict[str, Any]:
     origin = origin_iata.upper().strip()
     dest = dest_iata.upper().strip()
-    args = {"origin": origin, "destination": dest, "date": date, "cabin": cabin, "adults": adults}
+    args = {
+        "origin": origin, "destination": dest, "date": date,
+        "cabin": cabin, "adults": adults,
+        "prefer_carriers": sorted(prefer_carriers) if prefer_carriers else None,
+        "exclude_carriers": sorted(exclude_carriers) if exclude_carriers else None,
+    }
     bucket = date_type.fromisoformat(date)
 
     cached = await cache_get(ctx["pool"], "flight_check", args, bucket)
@@ -104,7 +116,12 @@ async def _flight_impl(
         return cached
 
     try:
-        result = await search_offers(ctx["client"], origin, dest, date, adults=adults, cabin=cabin)
+        result = await search_offers(
+            ctx["client"], origin, dest, date,
+            adults=adults, cabin=cabin,
+            prefer_carriers=prefer_carriers,
+            exclude_carriers=exclude_carriers,
+        )
     except DuffelError as e:
         return {
             "ok": False,
@@ -266,6 +283,8 @@ async def travel_flight_check(
     date: str,
     cabin: str = "economy",
     adults: int = 2,
+    prefer_carriers: list[str] | None = None,
+    exclude_carriers: list[str] | None = None,
 ) -> str:
     """Find flight offers between two airports on a date.
 
@@ -275,12 +294,28 @@ async def travel_flight_check(
         date: Departure date in ISO format (YYYY-MM-DD).
         cabin: Cabin class — 'economy', 'premium_economy', 'business', 'first'.
         adults: Number of adult passengers (default 2).
+        prefer_carriers: Soft preference — matching offers move to top of
+            results, non-matching kept as fallback below. Match is by IATA
+            code OR case-insensitive substring on carrier name; checks
+            both `owner` and per-segment `marketing_carrier`. E.g.
+            ['BA','AY'] for British Airways or Finnair, ['easyJet'] for
+            substring match. Affects ranking order, not which offers are
+            returned.
+        exclude_carriers: Hard exclusion — drops matching offers entirely.
+            Same matching shape. E.g. ['Ryanair','Wizz'] to avoid budget
+            carriers, ['U2','FR'] by IATA code.
 
-    Returns up to 5 offers ranked by price plus a Skyscanner deeplink as
-    a booking fallback. Uses Duffel test mode unless DUFFEL_MODE=live.
+    Returns up to 5 offers ranked by price (with preferred carriers
+    bubbled to the top) plus a Skyscanner deeplink as a booking fallback.
+    Uses Duffel test mode unless DUFFEL_MODE=live.
     """
     return json.dumps(
-        await _flight_impl(_ctx(), origin_iata, dest_iata, date, cabin, adults), indent=2
+        await _flight_impl(
+            _ctx(), origin_iata, dest_iata, date, cabin, adults,
+            prefer_carriers=prefer_carriers,
+            exclude_carriers=exclude_carriers,
+        ),
+        indent=2,
     )
 
 
@@ -417,6 +452,8 @@ async def travel_compare_modes(
             date=flight.get("date", date),
             cabin=flight.get("cabin", "economy"),
             adults=flight.get("adults", 2),
+            prefer_carriers=flight.get("prefer_carriers"),
+            exclude_carriers=flight.get("exclude_carriers"),
         )
 
     if eurostar is not None:
@@ -752,6 +789,8 @@ async def travel_plan_trip(
     dest_airports: list[str] | None = None,
     overnight_near: str | None = None,
     prefer_affiliation: str | None = None,
+    prefer_carriers: list[str] | None = None,
+    exclude_carriers: list[str] | None = None,
 ) -> str:
     """Plan a trip from Farley Green to a destination — door-to-door, mode-aware.
 
@@ -783,6 +822,128 @@ async def travel_plan_trip(
             fly_only=fly_only, dest_airports=dest_airports,
             overnight_near=overnight_near,
             prefer_affiliation=prefer_affiliation,
+            prefer_carriers=prefer_carriers,
+            exclude_carriers=exclude_carriers,
+        ),
+        indent=2,
+    )
+
+
+@mcp.tool()
+async def travel_ferry_check(
+    origin_port: str,
+    dest_port: str,
+    date: str,
+    vehicle: str = "car",
+    passengers: int = 2,
+) -> str:
+    """Find ferry crossings between two named ports on a date.
+
+    Static-timetable data — operators don't expose public booking APIs.
+    Returns one entry per operator/route combo (e.g. Dover→Calais comes
+    back as DFDS, P&O Ferries, and Irish Ferries — three rows). Includes
+    crossing minutes, terminal overhead, total terminal-to-terminal time,
+    operator-side booking URL.
+
+    Args:
+        origin_port: Substring of port name — 'Dover', 'Portsmouth',
+                     'Holyhead', 'Cairnryan' etc. Case-insensitive.
+        dest_port: Substring of destination port. 'Calais', 'Dublin',
+                   'Belfast', 'Caen', etc.
+        date: ISO date (YYYY-MM-DD).
+        vehicle: 'car' (default), 'high-vehicle', 'caravan-trailer',
+                 'motorcycle', or 'foot-passenger'.
+        passengers: Headcount (default 2).
+    """
+    try:
+        result = await ferry_check(
+            None, origin_port=origin_port, dest_port=dest_port,
+            date=date, vehicle=vehicle, passengers=passengers,
+        )
+    except FerryError as e:
+        return json.dumps({"ok": False, "mode": "ferry", "error": str(e),
+                           "origin_port": origin_port, "dest_port": dest_port,
+                           "date": date}, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def travel_ferry_routes_to(
+    country_or_region: str,
+) -> str:
+    """List ferry routes whose destination matches a country / region.
+
+    Useful for discovery before `travel_ferry_check`: 'where can I sail
+    from the UK to France / Ireland / Spain / Netherlands?' Accepts
+    country names ('Ireland', 'France'), ISO codes ('IE', 'FR'), or
+    region groupings ('Channel', 'North Sea', 'Irish Sea',
+    'British Isles', 'Northern Ireland').
+
+    Returns a list of routes (origin_port, dest_port, operator,
+    crossing_minutes, frequency, seasonal flag) sorted by crossing time.
+    """
+    routes = ferry_routes_to(country_or_region)
+    if not routes:
+        return json.dumps({
+            "ok": True, "country_or_region": country_or_region, "routes": [],
+            "note": f"No curated routes for {country_or_region!r}. Known regions: "
+                    "France, Spain, Netherlands, Belgium, Ireland, Northern Ireland, "
+                    "Isle of Man, Channel, North Sea, Irish Sea, British Isles.",
+        }, indent=2)
+    routes_sorted = sorted(routes, key=lambda r: r["crossing_minutes"])
+    return json.dumps({
+        "ok": True,
+        "country_or_region": country_or_region,
+        "count": len(routes_sorted),
+        "routes": routes_sorted,
+    }, indent=2)
+
+
+@mcp.tool()
+async def travel_plan_multi_leg(
+    name: str,
+    legs: list[dict],
+    stops: list[dict] | None = None,
+    party: list[str] | None = None,
+    pacing_seconds: float = 6.0,
+    prefer_carriers: list[str] | None = None,
+    exclude_carriers: list[str] | None = None,
+) -> str:
+    """Plan a multi-leg trip — N flights + M hotel stays — in one call.
+
+    Each leg gets a Duffel `flight_check`; legs are run sequentially with
+    `pacing_seconds` (default 6 s) between calls to stay under Duffel's
+    rate limit. Each stop gets a LiteAPI `hotel_search` (run in parallel
+    — LiteAPI tolerates fan-out). Aggregates total flight cost +
+    hours, total hotel cost (cheapest 4★+ × nights), and persists the
+    whole itinerary as one journey_log row keyed by `name`.
+
+    Args:
+        name: Human-readable itinerary name (logged + returned).
+        legs: List of flight specs:
+              [{"orig":"LHR","dest":"EZE","date":"2026-09-01",
+                "cabin":"business","adults":2}, ...]
+              `cabin` defaults to 'economy', `adults` defaults to party size.
+        stops: Optional list of hotel-stay specs:
+               [{"city":"Buenos Aires","check_in":"2026-09-01",
+                 "check_out":"2026-09-06","min_stars":4,
+                 "pet_friendly":false,"radius_km":25,"max_results":5,
+                 "chain_contains":null}, ...]
+        party: Default = is_default=true rows from party_member.
+        pacing_seconds: Delay between Duffel calls. Lower → faster but
+                        risks 429. Default 6 s is well within tolerance.
+
+    Returns one structured object with `flights[]`, `hotels[]`,
+    `total_flight_cost`, `total_hotel_cost`, `total_estimated_cost`,
+    `total_flight_hours`. Use `travel_recent_trips` to retrieve later
+    (the `[multi-leg] <name>` row in journey_log).
+    """
+    return json.dumps(
+        await plan_multi_leg_impl(
+            _ctx(), name=name, legs=legs, stops=stops,
+            party=party, pacing_seconds=pacing_seconds,
+            prefer_carriers=prefer_carriers,
+            exclude_carriers=exclude_carriers,
         ),
         indent=2,
     )
