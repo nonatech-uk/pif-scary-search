@@ -40,12 +40,52 @@ def _skyscanner_deeplink(orig: str, dest: str, date: str, adults: int, cabin: st
     )
 
 
+def _parse_iso_minutes(s: str | None) -> int:
+    """ISO 8601 duration → minutes. Handles PT3H20M, P1DT11H35M, P2D etc."""
+    if not s or not s.startswith("P"):
+        return 0
+    rest = s[1:]
+    if "T" in rest:
+        date_part, time_part = rest.split("T", 1)
+    else:
+        date_part, time_part = rest, ""
+    days = 0
+    cur = ""
+    for ch in date_part:
+        if ch.isdigit():
+            cur += ch
+        elif ch == "D":
+            days = int(cur or "0")
+            cur = ""
+    total = days * 24 * 60
+    cur = ""
+    for ch in time_part:
+        if ch.isdigit():
+            cur += ch
+        elif ch == "H":
+            total += int(cur or "0") * 60
+            cur = ""
+        elif ch == "M":
+            total += int(cur or "0")
+            cur = ""
+    return total
+
+
 def _summarise_slice(slc: dict) -> dict:
     segments = slc.get("segments", [])
+    # Block time = sum of per-segment durations (in-air only)
+    # Elapsed   = slice-level duration string (gate-to-gate, includes layover)
+    elapsed_iso = slc.get("duration")
+    elapsed_min = _parse_iso_minutes(elapsed_iso)
+    block_min = sum(_parse_iso_minutes(seg.get("duration")) for seg in segments)
+    layover_min = max(elapsed_min - block_min, 0) if (elapsed_min and block_min) else 0
     return {
         "origin": slc.get("origin", {}).get("iata_code"),
         "destination": slc.get("destination", {}).get("iata_code"),
-        "duration": slc.get("duration"),
+        "duration": elapsed_iso,            # back-compat ISO string (gate-to-gate)
+        "elapsed_minutes": elapsed_min,     # gate-to-gate including layovers
+        "block_minutes": block_min,         # in-air time only (sum of segment durations)
+        "layover_minutes": layover_min,     # ground time at intermediate stops
         "depart": segments[0]["departing_at"] if segments else None,
         "arrive": segments[-1]["arriving_at"] if segments else None,
         "stops": max(len(segments) - 1, 0),

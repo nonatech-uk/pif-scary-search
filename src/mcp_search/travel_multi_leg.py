@@ -79,6 +79,7 @@ async def _run_one_leg(
         }
     offers = result.get("offers") or []
     cheapest = offers[0] if offers else None
+    slc = cheapest["slices"][0] if cheapest and cheapest.get("slices") else None
     return {
         "ok": True,
         "leg": f"{orig}→{dest}",
@@ -90,14 +91,12 @@ async def _run_one_leg(
         "cheapest_price": cheapest["total_amount"] if cheapest else None,
         "cheapest_currency": cheapest["total_currency"] if cheapest else None,
         "cheapest_carrier": cheapest.get("owner") if cheapest else None,
-        "cheapest_minutes": (
-            _parse_iso_duration_min(cheapest["slices"][0]["duration"])
-            if cheapest and cheapest.get("slices") else None
-        ),
-        "cheapest_stops": (
-            cheapest["slices"][0].get("stops")
-            if cheapest and cheapest.get("slices") else None
-        ),
+        "cheapest_block_minutes": slc.get("block_minutes") if slc else None,
+        "cheapest_elapsed_minutes": slc.get("elapsed_minutes") if slc else None,
+        "cheapest_layover_minutes": slc.get("layover_minutes") if slc else None,
+        "cheapest_stops": slc.get("stops") if slc else None,
+        # legacy field — keep but make explicit it's elapsed (gate-to-gate)
+        "cheapest_minutes": slc.get("elapsed_minutes") if slc else None,
         "booking_deeplink": result.get("booking_deeplink"),
     }
 
@@ -189,9 +188,16 @@ async def plan_multi_leg_impl(
     total_flight_cost = sum(
         (f.get("cheapest_price") or 0) for f in flight_results if f.get("ok")
     )
-    total_flight_minutes = sum(
-        (f.get("cheapest_minutes") or 0) for f in flight_results if f.get("ok")
+    # Use block time (sum of per-segment in-air) for "total flight time" — more
+    # honest than elapsed which double-counts long layovers.
+    total_block_minutes = sum(
+        (f.get("cheapest_block_minutes") or 0) for f in flight_results if f.get("ok")
     )
+    total_elapsed_minutes = sum(
+        (f.get("cheapest_elapsed_minutes") or 0) for f in flight_results if f.get("ok")
+    )
+    # Legacy aggregate name — kept for back-compat, now preferring block time
+    total_flight_minutes = total_block_minutes
     total_hotel_cost = 0.0
     for h in hotel_results:
         if not h.get("ok"):
@@ -213,8 +219,11 @@ async def plan_multi_leg_impl(
         "stops_count": len(stops) if stops else 0,
         "total_flight_cost": round(total_flight_cost, 2),
         "total_flight_currency": flight_currency,
-        "total_flight_minutes": total_flight_minutes,
-        "total_flight_hours": round(total_flight_minutes / 60, 1) if total_flight_minutes else 0,
+        "total_flight_minutes": total_flight_minutes,           # legacy (== block)
+        "total_block_minutes": total_block_minutes,             # in-air only
+        "total_elapsed_minutes": total_elapsed_minutes,         # gate-to-gate w/ layovers
+        "total_flight_hours": round(total_block_minutes / 60, 1) if total_block_minutes else 0,
+        "total_elapsed_hours": round(total_elapsed_minutes / 60, 1) if total_elapsed_minutes else 0,
         "total_hotel_cost": round(total_hotel_cost, 2),
         "total_estimated_cost": round(total_flight_cost + total_hotel_cost, 2),
         "flights": flight_results,

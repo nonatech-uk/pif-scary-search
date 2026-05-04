@@ -265,8 +265,10 @@ async def build_flight(
         cheapest = offers["offers"][0] if offers.get("offers") else None
         if not cheapest:
             return {"ok": False, "mode": "flight", "error": f"no Duffel offers {origin_iata}→{dest_iata}"}
-        # ISO 8601 duration parser — Duffel returns 'PT2H5M' style
-        flight_min = _parse_iso_duration_min(cheapest["slices"][0]["duration"])
+        slc = cheapest["slices"][0]
+        # Use block time (in-air, sum of segment durations) for door-to-door
+        # ranking — more honest than elapsed which double-counts long layovers.
+        flight_min = slc.get("block_minutes") or _parse_iso_duration_min(slc.get("duration") or "")
         flight_carrier = cheapest["owner"]
         flight_price = cheapest["total_amount"]
         flight_currency = cheapest["total_currency"]
