@@ -942,11 +942,28 @@ async def travel_eurostar_prices_via_safari(
     parsing_hints = {
         "price_pattern": r"£\s?\d+(?:\.\d{2})?",
         "time_pattern": r"\d{2}:\d{2}\s*[→\-–]\s*\d{2}:\d{2}",
-        "fare_classes": ["Standard", "Standard Premier", "Business Premier"],
+        # UI fare class names (verified 2026-05-04). These differ from
+        # the GraphQL backend codes (STD / SP / BP) which the journeys
+        # array uses — UI displays the marketing names below.
+        "fare_classes_ui": ["Eurostar Standard", "Eurostar Plus", "Eurostar Premier"],
+        "fare_classes_backend_map": {
+            "STD": "Eurostar Standard",
+            "SP":  "Eurostar Plus",       # was "Standard Premier" pre-2024
+            "BP":  "Eurostar Premier",    # was "Business Premier" pre-2024
+        },
+        "page_layout": (
+            "Each train block has 'Departs:HH:MM' / 'Arrives:HH:MM' / "
+            "'Journey duration: N hr N min' / 'Direct' or 'N change' "
+            "followed by three fare-class rows. Each row is either "
+            "'£NN' (often with 'NN seats left' / 'Only N seats left') "
+            "or 'Not available'. Lowest fare is tagged 'Lowest fare'."
+        ),
+        "seats_pattern": r"(\d+ seats left|Only \d+ seats? left|Not available)",
         "note": (
-            "Eurostar's React app shows the cheapest fare per train as "
-            "'From £XX'; per-class prices appear after clicking a train. "
-            "For round-trips, prices may show as outbound+return total."
+            "Direct trains list as 'Direct route'; non-direct list "
+            "'1 change' (typically via Brussels for Amsterdam, via Lille "
+            "for Paris). For round-trips the prices shown are the "
+            "outbound leg only — the inbound is on a separate page."
         ),
     }
 

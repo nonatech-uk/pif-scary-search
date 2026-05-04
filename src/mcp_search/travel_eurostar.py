@@ -137,19 +137,20 @@ def _booking_url(
     adults: int,
     return_date: str | None = None,
 ) -> str:
+    """Build the Eurostar search URL. Confirmed shape (2026-05-04):
+        /search/uk-en?adult=N&origin=UIC&destination=UIC&outbound=YYYY-MM-DD[&inbound=YYYY-MM-DD]
+    Param names: `adult` (singular), `origin`, `destination`,
+    `outbound`, `inbound`. UIC station codes."""
     params: dict[str, Any] = {
-        "trainOriginStation": o_code,
-        "trainDestinationStation": d_code,
+        "adult": adults,
+        "origin": o_code,
+        "destination": d_code,
         "outbound": date,
-        "adults": adults,
     }
     if return_date:
-        params["travelMode"] = "return"
         params["inbound"] = return_date
-    else:
-        params["travelMode"] = "oneway"
     qs = urlencode(params)
-    return f"https://www.eurostar.com/uk-en/book?{qs}"
+    return f"https://www.eurostar.com/search/uk-en?{qs}"
 
 
 def build_booking_url(
