@@ -107,83 +107,27 @@ _RAW: list[tuple[str, str, str, str, int, str, int, bool, str | None, str]] = [
 ]
 
 
-# Per-operator URL-builder verification status. Flip an entry to True
-# only after a real URL has been confirmed against the live booking
-# results page (via apple_browser_get_page_text or manual visit).
-# Unverified URLs may still work as a "land on the homepage" fallback
-# but won't pre-fill the search form for the Safari-pricecheck flow.
-_URL_VERIFIED: dict[str, bool] = {
-    "dfds":           False,
-    "p&o ferries":    False,
-    "irish ferries":  False,
-    "brittany":       False,
-    "stena":          False,
-    "steam packet":   False,
-}
-
-
-def _operator_key(operator: str) -> str:
-    op = operator.lower()
-    if "p&o" in op or "p and o" in op:
-        return "p&o ferries"
-    for k in ("dfds", "irish", "brittany", "stena", "steam packet"):
-        if k in op:
-            return k
-    return op
-
-
 def _booking_url(operator: str, orig: str, dest: str, date: str, vehicle: str, passengers: int) -> str:
-    """Best-effort search-page URL for the operator (each does it differently).
-    Patterns marked unverified in _URL_VERIFIED are guesswork; verify by
-    driving the booking flow in Safari and back-porting the real shape."""
+    """Operator homepage URL — every ferry operator's booking SPA strips
+    search state from the URL on the results page (DFDS, Brittany Ferries,
+    Stena, Trenitalia-style obfuscation across the industry, verified
+    2026-05-04). Pre-fill via query string isn't viable; users have to
+    fill the form on the operator's site directly. We return the most
+    useful landing URL per operator and let them complete the search."""
     op_lower = operator.lower()
     if "dfds" in op_lower:
-        return f"https://www.dfds.com/en/passenger-ferries?search=ferry&route={orig.replace(' ','+')}-{dest.replace(' ','+')}&outbound={date}"
+        return "https://www.dfds.com/en/passenger-ferries"
     if "p&o" in op_lower or "p and o" in op_lower:
-        return f"https://www.poferries.com/en/?destination={dest.replace(' ','-').lower()}&outbound={date}"
+        return "https://www.poferries.com/en/"
     if "brittany" in op_lower:
-        return f"https://www.brittany-ferries.co.uk/?from={orig.replace(' ','-').lower()}&to={dest.replace(' ','-').lower()}&out={date}"
+        return "https://www.brittany-ferries.co.uk/"
     if "irish" in op_lower:
-        return f"https://www.irishferries.com/?from={orig.replace(' ','-').lower()}&to={dest.replace(' ','-').lower()}&date={date}"
+        return "https://www.irishferries.com/"
     if "stena" in op_lower:
-        return f"https://www.stenaline.co.uk/?from={orig.replace(' ','-').lower()}&to={dest.replace(' ','-').lower()}&out={date}"
+        return "https://www.stenaline.co.uk/"
     if "steam packet" in op_lower:
-        return f"https://www.steam-packet.com/?route={orig.replace(' ','-').lower()}-{dest.replace(' ','-').lower()}&date={date}"
+        return "https://www.steam-packet.com/"
     return f"https://www.google.com/search?q={urlencode({'q': f'{operator} {orig} to {dest} {date}'})[2:]}"
-
-
-def build_search_workflows(
-    origin_port: str,
-    dest_port: str,
-    date: str,
-    vehicle: str = "car",
-    passengers: int = 2,
-) -> list[dict[str, Any]]:
-    """Return a list of {operator, route, url, verified} entries for every
-    curated route between the two ports. Used by the Safari-pricecheck
-    tool — feed each entry's url to apple_browser_open_url and read the
-    rendered text for prices."""
-    matches = find_route(origin_port, dest_port)
-    if not matches:
-        return []
-    out: list[dict[str, Any]] = []
-    for r in matches:
-        op_key = _operator_key(r["operator"])
-        url = _booking_url(r["operator"], r["origin_port"], r["dest_port"], date, vehicle, passengers)
-        out.append({
-            "operator": r["operator"],
-            "operator_key": op_key,
-            "origin_port": r["origin_port"],
-            "dest_port": r["dest_port"],
-            "country_to": r["country_to"],
-            "crossing_minutes": r["crossing_minutes"],
-            "frequency": r["frequency"],
-            "seasonal": r["seasonal"],
-            "notes": r["notes"],
-            "search_url": url,
-            "url_verified": _URL_VERIFIED.get(op_key, False),
-        })
-    return out
 
 
 ROUTES: list[dict[str, Any]] = [
