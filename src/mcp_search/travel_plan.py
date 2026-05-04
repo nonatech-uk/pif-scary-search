@@ -73,6 +73,53 @@ async def _drive_or_fallback(
         }
 
 
+# Car-free destinations where the village itself isn't drivable —
+# substitute the parking-station coords for the drive lookup, then
+# add a short final transit hop.
+_CAR_FREE_PARKING: dict[tuple[float, float], dict[str, Any]] = {
+    # (lat, lon) → parking + final-leg metadata. Lat/lon are ROUNDED
+    # to 2 dp for matching, so coords within ~1km of a known car-free
+    # destination route correctly.
+    (46.02, 7.75): {  # Zermatt
+        "village": "Zermatt",
+        "parking_lat": 46.066, "parking_lon": 7.7787,
+        "parking_name": "Täsch (Zermatt parking)",
+        "final_minutes": 12,
+        "final_operator": "MGB",
+        "final_kind": "train",
+        "final_note": (
+            "MGB shuttle train Täsch → Zermatt (12 min, every 20 min, "
+            "~CHF 8 each way; Zermatt itself is car-free)"
+        ),
+    },
+}
+
+
+def _resolve_drive_target(dest: dict) -> tuple[float, float, dict | None]:
+    """If the destination is a known car-free village, return parking
+    coords + final-leg metadata. Otherwise return the destination's
+    own coords + None."""
+    key = (round(dest["lat"], 2), round(dest["lon"], 2))
+    info = _CAR_FREE_PARKING.get(key)
+    if info:
+        return info["parking_lat"], info["parking_lon"], info
+    return dest["lat"], dest["lon"], None
+
+
+def _final_leg_from(info: dict | None) -> list[dict[str, Any]]:
+    """Return [final_train_leg] if needed, else []."""
+    if not info:
+        return []
+    return [{
+        "kind": info["final_kind"],
+        "from": info["parking_name"].split(" (")[0],
+        "to": info["village"],
+        "minutes": info["final_minutes"],
+        "operator": info["final_operator"],
+        "note": info["final_note"],
+    }]
+
+
 async def build_eurotunnel(
     ctx, dest: dict, depart_dt: datetime,
     origin: str = ORIGIN_HOME_DEFAULT, origin_label: str = ORIGIN_HOME_LABEL_DEFAULT,
@@ -88,13 +135,20 @@ async def build_eurotunnel(
     arrive_folkestone = depart_dt + timedelta(minutes=drive_min_uk)
     crossing_depart_uk = arrive_folkestone + timedelta(minutes=PREDEPARTURE_BUFFER_MIN)
     crossing_arrive_fr = crossing_depart_uk + timedelta(minutes=35 + 5)  # 35 crossing + 5 customs
-    # Calais Coquelles → destination (lat/lon)
+    # Calais Coquelles → destination — substitute parking-station coords
+    # for car-free villages (Zermatt → Täsch). Final leg appended below.
+    drive_target_lat, drive_target_lon, carfree = _resolve_drive_target(dest)
+    final_legs = _final_leg_from(carfree)
+    final_minutes = sum(l["minutes"] for l in final_legs)
+
+    # Static fallback: Calais → most European destinations is 3-10h.
+    # We pick a reasonable default; live Google Maps overrides it.
     drive_calais = await _drive_or_fallback(
         ctx["client"],
         "Calais Eurotunnel Terminal, France",
-        f"{dest['lat']},{dest['lon']}",
+        f"{drive_target_lat},{drive_target_lon}",
         _to_iso_z(crossing_arrive_fr),
-        fallback_min=200,
+        fallback_min=540,   # 9h fallback for distant Alpine destinations
     )
     drive_min_fr = int(round(drive_calais["duration_minutes"]))
 
@@ -119,7 +173,7 @@ async def build_eurotunnel(
     best_price = selected.get("best_price")
     currency = et.get("currency") or "GBP"
 
-    door_to_door = drive_min_uk + PREDEPARTURE_BUFFER_MIN + 35 + 5 + drive_min_fr
+    door_to_door = drive_min_uk + PREDEPARTURE_BUFFER_MIN + 35 + 5 + drive_min_fr + final_minutes
     crossing_note = "35 min crossing + 5 min customs/disembark"
     if et_live and actual_dep_iso:
         crossing_note = f"{crossing_note}; live slot {crossing_depart_uk.strftime('%H:%M')}"
@@ -141,10 +195,12 @@ async def build_eurotunnel(
          "price": best_price, "price_currency": currency if best_price is not None else None,
          "booking_url": et.get("booking_url"),
          "note": crossing_note},
-        {"kind": "drive", "from": "Calais Coquelles", "to": dest["display_name"],
+        {"kind": "drive", "from": "Calais Coquelles",
+         "to": (carfree["parking_name"] if carfree else dest["display_name"]),
          "minutes": drive_min_fr, "operator": "self-drive",
          "note": f"{drive_calais.get('distance_km','?')} km via French motorway"
                  + (" (live traffic)" if not drive_calais.get("fallback") else " (static estimate)")},
+        *final_legs,
     ]
     return {
         "ok": True,
@@ -339,18 +395,25 @@ async def build_flight(
         return {"ok": False, "mode": "flight" + ("/geneva-drive" if alps_geneva else ""),
                 "error": f"flight lookup failed: {type(e).__name__}: {str(e)[:200]}"}
 
-    # Drive at destination
+    # Drive at destination — for car-free villages (Zermatt) substitute
+    # the parking-station coords and append the final transit hop.
+    drive_target_lat, drive_target_lon, carfree = _resolve_drive_target(dest)
+    final_legs = _final_leg_from(carfree)
+    final_minutes = sum(l["minutes"] for l in final_legs)
+
     arrive_apt = depart_dt + timedelta(minutes=drive_min_uk + AIRPORT_OVERHEAD_MIN + flight_min + 30)
     drive_dest = await _drive_or_fallback(
         ctx["client"],
         f"{dest_iata} airport",
-        f"{dest['lat']},{dest['lon']}",
+        f"{drive_target_lat},{drive_target_lon}",
         _to_iso_z(arrive_apt),
-        fallback_min=60 if alps_geneva else 30,
+        # GVA → Alpine ski resort is typically 90-210 min depending on
+        # destination; use a generous floor for the static fallback.
+        fallback_min=180 if alps_geneva else 30,
     )
     drive_min_dest = int(round(drive_dest["duration_minutes"]))
 
-    door_to_door = drive_min_uk + AIRPORT_OVERHEAD_MIN + flight_min + 30 + drive_min_dest
+    door_to_door = drive_min_uk + AIRPORT_OVERHEAD_MIN + flight_min + 30 + drive_min_dest + final_minutes
     mode = "fly_geneva_drive" if alps_geneva else "flight"
     legs = [
         {"kind": "drive", "from": origin_label, "to": f"{origin_iata} airport",
@@ -365,10 +428,13 @@ async def build_flight(
          "note": f"£{flight_price} {flight_currency} (cheapest of {len(offers['offers'])} offers)"},
         {"kind": "wait", "from": f"{dest_iata} airport", "to": f"{dest_iata} airport",
          "minutes": 30, "note": "Disembark + baggage + walk to car"},
-        {"kind": "drive", "from": f"{dest_iata} airport", "to": dest["display_name"],
+        {"kind": "drive",
+         "from": f"{dest_iata} airport",
+         "to": (carfree["parking_name"] if carfree else dest["display_name"]),
          "minutes": drive_min_dest, "operator": "hire car / taxi",
          "note": f"{drive_dest.get('distance_km','?')} km"
                  + (" (live traffic)" if not drive_dest.get("fallback") else " (static estimate)")},
+        *final_legs,
     ]
     return {
         "ok": True,
@@ -472,8 +538,13 @@ async def build_north_sea_ferry(
     arrive_continent = depart_dt + timedelta(
         minutes=pick["drive_home_min"] + 60 + pick["crossing_min"] + 30,
     )
+    # Substitute parking-station coords for car-free destinations.
+    drive_target_lat, drive_target_lon, carfree = _resolve_drive_target(dest)
+    final_legs = _final_leg_from(carfree)
+    final_minutes = sum(l["minutes"] for l in final_legs)
+
     drive_dest = await _drive_or_fallback(
-        ctx["client"], pick["dest_port_geo"], f"{dest['lat']},{dest['lon']}",
+        ctx["client"], pick["dest_port_geo"], f"{drive_target_lat},{drive_target_lon}",
         _to_iso_z(arrive_continent), fallback_min=240,
     )
     drive_min_dest = int(round(drive_dest["duration_minutes"]))
@@ -526,7 +597,7 @@ async def build_north_sea_ferry(
             live = None
 
     door_to_door = (
-        pick["drive_home_min"] + 60 + pick["crossing_min"] + 30 + drive_min_dest
+        pick["drive_home_min"] + 60 + pick["crossing_min"] + 30 + drive_min_dest + final_minutes
     )
 
     ferry_note = f"Overnight crossing (~{pick['crossing_min']//60}h{pick['crossing_min']%60:02d}m)"
@@ -556,11 +627,13 @@ async def build_north_sea_ferry(
             "minutes": 30, "note": "Vehicle disembarkation + customs",
         },
         {
-            "kind": "drive", "from": pick["dest_port"], "to": dest["display_name"],
+            "kind": "drive", "from": pick["dest_port"],
+            "to": (carfree["parking_name"] if carfree else dest["display_name"]),
             "minutes": drive_min_dest, "operator": "self-drive",
             "note": f"{drive_dest.get('distance_km','?')} km Continental drive"
                     + (" (live traffic)" if not drive_dest.get("fallback") else " (static estimate)"),
         },
+        *final_legs,
     ]
     return {
         "ok": True,
