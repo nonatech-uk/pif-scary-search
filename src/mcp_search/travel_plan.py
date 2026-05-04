@@ -478,41 +478,60 @@ async def build_north_sea_ferry(
     )
     drive_min_dest = int(round(drive_dest["duration_minutes"]))
 
-    # Fetch live DFDS prices for the picked crossing if it's a DFDS route
-    # (Newcastle-Amsterdam is the only DFDS North Sea route; future
-    # additions e.g. Rosslare-Dunkirk could land here too).
-    dfds_live: dict[str, Any] | None = None
-    if "dfds" in pick["operator"].lower():
+    # Fetch live prices for the picked crossing per operator.
+    live: dict[str, Any] | None = None
+    op_lower = pick["operator"].lower()
+
+    if "dfds" in op_lower:
         try:
             from mcp_search.travel_dfds import (
                 get_sailings as dfds_sailings, is_known_route as dfds_known, DFDSError,
             )
             o = pick["uk_port"].lower()
-            d = pick["dest_port"].lower().split(" ")[0]   # 'IJmuiden' is the DFDS port
-            # DFDS route key for Newcastle-Amsterdam is ('newcastle','amsterdam')
+            d = pick["dest_port"].lower().split(" ")[0]
             o_key, d_key = ("newcastle", "amsterdam") if "newcastle" in o else (o, d)
             if dfds_known(o_key, d_key):
                 sailings = await dfds_sailings(
                     ctx["client"], date=depart_dt.strftime("%Y-%m-%d"),
-                    origin=o_key, destination=d_key,
-                    adults=2, vehicle="car",
+                    origin=o_key, destination=d_key, adults=2, vehicle="car",
                 )
                 avail = [s["best_price"] for s in sailings if s.get("best_price") is not None]
-                dfds_live = {
+                live = {
                     "sailings": sailings,
                     "best_price": min(avail) if avail else None,
                     "currency": sailings[0]["currency"] if sailings else None,
                 }
         except (DFDSError, Exception):
-            dfds_live = None
+            live = None
+
+    elif "stena" in op_lower:
+        try:
+            from mcp_search.travel_stena_line import (
+                get_sailings as stena_sailings, is_known_route as stena_known, StenaLineError,
+            )
+            # Stena's Harwich-Hook of Holland: pick['uk_port']='Harwich', pick['dest_port']='Hook of Holland'
+            if stena_known(pick["uk_port"], pick["dest_port"]):
+                sailings = await stena_sailings(
+                    ctx["client"], date=depart_dt.strftime("%Y-%m-%d"),
+                    origin=pick["uk_port"], destination=pick["dest_port"],
+                    adults=2, vehicle="car", currency="GBP",
+                )
+                avail = [s["best_price"] for s in sailings if s.get("best_price") is not None]
+                live = {
+                    "sailings": sailings,
+                    "best_price": min(avail) if avail else None,
+                    "currency": sailings[0]["currency"] if sailings else "GBP",
+                }
+        except (StenaLineError, Exception):
+            live = None
 
     door_to_door = (
         pick["drive_home_min"] + 60 + pick["crossing_min"] + 30 + drive_min_dest
     )
 
     ferry_note = f"Overnight crossing (~{pick['crossing_min']//60}h{pick['crossing_min']%60:02d}m)"
-    if dfds_live and dfds_live.get("best_price"):
-        ferry_note += f", from {dfds_live['currency']} {dfds_live['best_price']}"
+    if live and live.get("best_price"):
+        ferry_note += f", from {live['currency']} {live['best_price']}"
 
     legs = [
         {
@@ -528,8 +547,8 @@ async def build_north_sea_ferry(
         {
             "kind": "ferry", "from": pick["uk_port"], "to": pick["dest_port"],
             "minutes": pick["crossing_min"], "operator": pick["operator"],
-            "price": (dfds_live or {}).get("best_price"),
-            "price_currency": (dfds_live or {}).get("currency"),
+            "price": (live or {}).get("best_price"),
+            "price_currency": (live or {}).get("currency"),
             "note": ferry_note,
         },
         {
@@ -550,13 +569,17 @@ async def build_north_sea_ferry(
         "transfers": 1,
         "legs": legs,
         "total_cost_gbp": (
-            dfds_live["best_price"]
-            if dfds_live and dfds_live.get("currency") == "GBP"
-               and dfds_live.get("best_price") is not None
+            live["best_price"]
+            if live and live.get("currency") == "GBP"
+               and live.get("best_price") is not None
             else None
         ),
         "data_sources": [
-            "dfds-live" if dfds_live else "static-table",
+            (
+                "dfds-live" if live and "dfds" in op_lower else
+                "stena-line-live" if live and "stena" in op_lower else
+                "static-table"
+            ),
             "google-maps" if not pick["drive_home_fallback"] else "static-fallback",
             "google-maps" if not drive_dest.get("fallback") else "static-fallback",
         ],

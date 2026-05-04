@@ -175,14 +175,24 @@ def routes_to(country_or_region: str) -> list[dict[str, Any]]:
 
 def find_route(origin_port: str, dest_port: str) -> list[dict[str, Any]]:
     """All routes (potentially multiple operators) between named ports.
-    Case-insensitive substring match so `dover`/`calais` finds `Dover`/`Calais`.
-    """
+    Case-insensitive substring match. Bidirectional — finds routes
+    listed in either direction, since most operators run both ways. If
+    the table has the route in reverse, returns a swapped copy so
+    origin/dest match what the caller asked for."""
     o = origin_port.strip().lower()
     d = dest_port.strip().lower()
-    return [
-        r for r in ROUTES
-        if o in r["origin_port"].lower() and d in r["dest_port"].lower()
-    ]
+    matches = []
+    for r in ROUTES:
+        rop = r["origin_port"].lower()
+        rdp = r["dest_port"].lower()
+        if o in rop and d in rdp:
+            matches.append(r)
+        elif o in rdp and d in rop:
+            # Match in reverse — return a swapped copy so the caller
+            # sees their requested direction.
+            swapped = {**r, "origin_port": r["dest_port"], "dest_port": r["origin_port"]}
+            matches.append(swapped)
+    return matches
 
 
 async def check(
@@ -210,6 +220,9 @@ async def check(
     )
     from mcp_search.travel_brittany_ferries import (
         get_sailings as bf_sailings, is_known_route as bf_known, BrittanyFerriesError,
+    )
+    from mcp_search.travel_stena_line import (
+        get_sailings as stena_sailings, is_known_route as stena_known, StenaLineError,
     )
 
     data_sources: set[str] = {"static-table"}
@@ -289,6 +302,50 @@ async def check(
                 opt["data_sources"] = ["brittany-ferries-live"]
                 data_sources.add("brittany-ferries-live")
             except BrittanyFerriesError as e:
+                opt["live_error"] = str(e)
+
+        # Stena Line routes — GraphQL, multi-currency, full passenger/vehicle matrix.
+        elif (
+            client is not None
+            and "stena" in op_lower
+            and stena_known(r["origin_port"], r["dest_port"])
+        ):
+            try:
+                # Stena vehicle vocabulary differs slightly from our static one.
+                stena_vehicle = (
+                    "car" if vehicle in ("car",) else
+                    "large_car" if vehicle in ("high-vehicle", "caravan-trailer") else
+                    "motorhome" if vehicle == "motorhome" else
+                    "motorbike" if vehicle == "motorcycle" else
+                    "bicycle" if vehicle == "bicycle" else
+                    "none"
+                )
+                # Stena's GraphQL accepts any currency and converts server-side.
+                # GBP works for every route (verified Holyhead-Dublin gives GBP
+                # quotes; EUR for that route returns 0 sailings). Stu is UK-
+                # based so GBP is the most useful default everywhere.
+                stena_cur = "GBP"
+                sailings = await stena_sailings(
+                    client,
+                    date=date,
+                    origin=r["origin_port"],
+                    destination=r["dest_port"],
+                    adults=passengers,
+                    vehicle=stena_vehicle,
+                    currency=stena_cur,
+                )
+                available = [
+                    s["best_price"] for s in sailings
+                    if s.get("best_price") is not None
+                ]
+                opt["live_data"] = True
+                opt["sailings"] = sailings
+                opt["sailing_count"] = len(sailings)
+                opt["best_price"] = min(available) if available else None
+                opt["currency"] = sailings[0]["currency"] if sailings else stena_cur
+                opt["data_sources"] = ["stena-line-live"]
+                data_sources.add("stena-line-live")
+            except StenaLineError as e:
                 opt["live_error"] = str(e)
 
         options.append(opt)
