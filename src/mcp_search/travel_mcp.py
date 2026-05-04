@@ -45,6 +45,8 @@ from mcp_search.travel_renfe import RenfeError, search_journey as renfe_search
 from mcp_search.travel_austria import AustriaError, search_journey as austria_search
 from mcp_search.travel_norway import NorwayError, search_journey as norway_search
 from mcp_search.travel_sweden import SwedenError, search_journey as sweden_search
+from mcp_search.travel_uber import UberError, price_estimates as uber_prices, time_estimates as uber_times, _deeplink as uber_deeplink
+from mcp_search.travel_geocode import forward_geocode
 from mcp_search.travel_italy_status import ItalyStatusError, departures as italy_departures
 
 _TTL_FLIGHTS = 6 * 3600
@@ -646,6 +648,110 @@ async def travel_sweden_journey(
                            "error": str(e), "origin": origin,
                            "destination": destination, "datetime": datetime_iso}, indent=2)
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def travel_uber_estimate(
+    origin: str,
+    destination: str,
+) -> str:
+    """Uber Rides estimate — price ranges + pickup ETA (UK + global cities).
+
+    Geocodes free-text origin / destination via the same resolver
+    plan_trip uses (mylocation.place named-places → travel.geocode_cache
+    → Nominatim), then hits Uber's `/v1.2/estimates/price` and
+    `/v1.2/estimates/time` in parallel.
+
+    Returns per-product price ranges (UberX, Comfort, UberXL, Black,
+    etc., depending on availability at the pickup point) plus pickup
+    ETA per product. Plus a one-tap deeplink that opens the Uber
+    app/web with pickup+dropoff prefilled — works regardless of whether
+    UBER_CLIENT_ID/UBER_CLIENT_SECRET are set or whether the app has
+    been granted Rides API scopes by Uber business development.
+
+    Geographic note: Uber coverage is patchy outside major cities. UK
+    airports + cities = full coverage. Most European capitals = partial.
+    Rural France / Italy / smaller German cities = often no Uber at the
+    pickup point — the API will return an empty product list. Bolt is
+    often a better fit in eastern + southern Europe but isn't wired here.
+
+    Args:
+        origin: Free-text pickup ('Farley Green', 'GU5 9DN', 'LGW airport',
+                'Roma Termini', or 'lat,lon').
+        destination: Free-text dropoff (same forms).
+    """
+    ctx = _ctx()
+    pool = ctx["pool"]
+    client = ctx["client"]
+    pool_loc = ctx.get("pool_locations")
+
+    o = await forward_geocode(client, pool, origin, pool_locations=pool_loc)
+    d = await forward_geocode(client, pool, destination, pool_locations=pool_loc)
+    if not o or not d:
+        return json.dumps({
+            "ok": False, "mode": "rideshare", "service": "uber",
+            "error": f"could not geocode origin={origin!r} or destination={destination!r}",
+        }, indent=2)
+
+    deeplink = uber_deeplink(o["lat"], o["lon"], d["lat"], d["lon"])
+
+    # Try the API; if no token / API fails, return deeplink-only
+    try:
+        prices_task = uber_prices(client, o["lat"], o["lon"], d["lat"], d["lon"])
+        times_task = uber_times(client, o["lat"], o["lon"])
+        prices, times = await asyncio.gather(prices_task, times_task)
+    except UberError as e:
+        return json.dumps({
+            "ok": True,
+            "mode": "rideshare",
+            "service": "uber",
+            "from": o["display_name"],
+            "to": d["display_name"],
+            "from_lat": o["lat"], "from_lon": o["lon"],
+            "to_lat": d["lat"], "to_lon": d["lon"],
+            "deeplink": deeplink,
+            "live_data": False,
+            "note": f"Live estimates unavailable: {e}. Deeplink still works.",
+            "products": [],
+        }, indent=2)
+
+    # Merge price + time per product
+    times_by_product = {t.get("product_id"): t for t in times}
+    products = []
+    for p in prices:
+        pid = p.get("product_id")
+        t = times_by_product.get(pid) or {}
+        products.append({
+            "product_id": pid,
+            "product": p.get("display_name") or p.get("localized_display_name"),
+            "price_low": p.get("low_estimate"),
+            "price_high": p.get("high_estimate"),
+            "currency": p.get("currency_code"),
+            "price_estimate_str": p.get("estimate"),
+            "surge_multiplier": p.get("surge_multiplier"),
+            "duration_seconds": p.get("duration"),
+            "duration_minutes": (p.get("duration") or 0) // 60,
+            "distance_miles": p.get("distance"),
+            "pickup_eta_seconds": t.get("estimate"),
+            "pickup_eta_minutes": (t.get("estimate") or 0) // 60,
+        })
+
+    # Cheapest non-surge first if available
+    products.sort(key=lambda x: (x.get("price_low") or 99999))
+
+    return json.dumps({
+        "ok": True,
+        "mode": "rideshare",
+        "service": "uber",
+        "data_sources": ["uber-live"],
+        "from": o["display_name"],
+        "to": d["display_name"],
+        "from_lat": o["lat"], "from_lon": o["lon"],
+        "to_lat": d["lat"], "to_lon": d["lon"],
+        "deeplink": deeplink,
+        "live_data": True,
+        "products": products,
+    }, indent=2)
 
 
 @mcp.tool()
