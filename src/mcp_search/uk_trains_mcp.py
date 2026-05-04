@@ -460,17 +460,17 @@ async def _tapi_journey(
 async def uk_journey(
     origin: str,
     destination: str,
-    date: str | None = None,
-    time: str | None = None,
+    datetime_iso: str,
     is_arrival: bool = False,
-    limit: int = 4,
+    max_journeys: int = 5,
     window_hours: int = 6,
 ) -> str:
     """Plan a train journey between two UK stations.
 
     `origin` and `destination` accept CRS codes or station names.
-    `date` is YYYY-MM-DD, `time` is HH:MM (default: now). `is_arrival`
-    treats the time as a required arrival time instead of departure.
+    `datetime_iso` is ISO 8601 ('2026-06-15T09:00' or with timezone).
+    `is_arrival` treats the time as a required arrival time instead of
+    departure. Schema matches the rest of the travel_*_journey tools.
 
     Prefers Transport API's `/uk/public/journey` (change-aware routing)
     when the account's plan includes it. Falls back to RTT `filterTo`
@@ -480,12 +480,19 @@ async def uk_journey(
     from_crs, from_name = await _resolve_crs(origin)
     to_crs, to_name = await _resolve_crs(destination)
 
-    d = date or datetime.now().strftime("%Y-%m-%d")
-    t = time or datetime.now().strftime("%H:%M")
+    # Adapter: split unified ISO datetime into the upstream's native
+    # date + time strings (Transport API + RTT both want them separate).
+    if "T" in datetime_iso:
+        d, t = datetime_iso.split("T", 1)
+        # strip any trailing timezone / seconds — keep just HH:MM
+        t = t[:5]
+    else:
+        d = datetime_iso
+        t = datetime.now().strftime("%H:%M")
 
     # Try Transport API first (change-aware)
     if TAPI_APP_ID and TAPI_APP_KEY:
-        tapi_result = await _tapi_journey(from_crs, to_crs, d, t, is_arrival, limit)
+        tapi_result = await _tapi_journey(from_crs, to_crs, d, t, is_arrival, max_journeys)
         if tapi_result is not None:
             return tapi_result
         # Fall through to RTT direct-only with a note
@@ -494,13 +501,13 @@ async def uk_journey(
     try:
         time_from = datetime.fromisoformat(f"{d}T{t}")
     except ValueError:
-        raise RuntimeError(f"Could not parse date={date!r} time={time!r}")
+        raise RuntimeError(f"Could not parse datetime_iso={datetime_iso!r}")
 
     window_min = max(60, min(60 * window_hours, 23 * 60 + 59))
     services, _ = await _location_lineup(
         from_crs,
         kind="departure",
-        limit=limit,
+        limit=max_journeys,
         time_from=time_from,
         time_window_min=window_min,
         filter_to=to_crs,

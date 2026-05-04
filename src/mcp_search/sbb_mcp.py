@@ -160,13 +160,12 @@ async def travel_sbb_find_station(
 async def travel_sbb_journey(
     origin: str,
     destination: str,
+    datetime_iso: str,
+    is_arrival: bool = False,
+    max_journeys: int = 5,
     via: list[str] | str | None = None,
-    date: str | None = None,
-    time: str | None = None,
-    is_arrival_time: bool = False,
     transportations: list[str] | str | None = None,
     direct: bool = False,
-    limit: int = 4,
 ) -> str:
     """Plan a journey via the Swiss SBB / transport.opendata.ch planner.
 
@@ -187,21 +186,32 @@ async def travel_sbb_journey(
         for Italy-internal sections.
 
     `origin` and `destination` can be station names ("Zurich HB") or IDs.
-    Optional: `via` (1-5 intermediate stops), `date` (YYYY-MM-DD), `time`
-    (HH:MM), `is_arrival_time` (treat time as arrival instead of
-    departure), `transportations` (filter — any of: ice_tgv_rj, ec_ic,
-    ir, re_d, ship, bus, cableway, arz_ext, tramway_underground),
-    `direct` (no changes), `limit` (1-16).
+    `datetime_iso` is ISO 8601 ('2026-06-15T09:00' or with timezone) —
+    schema matches the rest of the travel_*_journey tools.
+    `is_arrival` treats the time as a required arrival.
+    Optional: `via` (1-5 intermediate stops), `transportations` (filter —
+    any of: ice_tgv_rj, ec_ic, ir, re_d, ship, bus, cableway, arz_ext,
+    tramway_underground), `direct` (no changes), `max_journeys` (1-16).
     """
     via_list = _transportations_list(via)
+
+    # Adapter: split unified ISO datetime into transport.opendata.ch's
+    # native date + time strings.
+    if "T" in datetime_iso:
+        date_part, time_part = datetime_iso.split("T", 1)
+        time_part = time_part[:5]   # keep just HH:MM
+    else:
+        date_part = datetime_iso
+        time_part = None
+
     params: dict = {
         "from": origin,
         "to": destination,
-        "date": date,
-        "time": time,
-        "isArrivalTime": 1 if is_arrival_time else 0,
+        "date": date_part,
+        "time": time_part,
+        "isArrivalTime": 1 if is_arrival else 0,
         "direct": 1 if direct else 0,
-        "limit": limit,
+        "limit": max(1, min(16, max_journeys)),
     }
     if via_list:
         params["via[]"] = via_list
