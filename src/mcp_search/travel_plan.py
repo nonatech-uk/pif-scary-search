@@ -1,0 +1,583 @@
+"""plan_trip orchestrator: per-mode door-to-door builders.
+
+Each builder takes the lifespan ctx + destination context + a target
+departure datetime, calls the appropriate single-mode tool plus
+drive_time for the access legs, and returns a normalised option dict:
+
+  {
+    "ok": bool,
+    "mode": "eurostar|flight|eurotunnel|fly_geneva_drive",
+    "door_to_door_minutes": int,
+    "transfers": int,           # count of mode-changes (1 = single change)
+    "legs": [                   # ordered list of journey segments
+      {"kind":"drive|train|flight|crossing|transfer",
+       "from": str, "to": str, "minutes": int, "operator": str?,
+       "booking_url": str?, "note": str?}
+    ],
+    "data_sources": [...],
+    "booking_urls": [...],
+    "trade_offs": [...],
+    "summary": str,
+  }
+
+The orchestrator (plan_trip) geocodes the destination, classifies its
+region, picks the candidate mode set, runs the builders concurrently
+with asyncio.gather, ranks them via travel_rank.score, and persists the
+ranked comparison to journey_log.
+"""
+
+import asyncio
+import json
+from datetime import date as date_type, datetime, timedelta, timezone
+from typing import Any
+
+from mcp_search.travel_drive import DriveError, drive_time as drive_route
+from mcp_search.travel_eurostar import STATIONS as EUROSTAR_STATIONS, check as eurostar_check
+from mcp_search.travel_eurotunnel import check as eurotunnel_check
+from mcp_search.travel_geocode import forward_geocode
+from mcp_search.travel_duffel import search_offers
+from mcp_search.travel_rank import (
+    AIRPORT_OVERHEAD_MIN,
+    PREDEPARTURE_BUFFER_MIN,
+    REGION_AIRPORTS,
+    REGION_EUROSTAR,
+    REGION_MODES,
+    SKI_RESORTS,
+    classify_region,
+    confidence,
+    score,
+)
+
+ORIGIN_HOME_DEFAULT = "GU5 0RW, UK"  # Farley Green canonical default
+ORIGIN_HOME_LABEL_DEFAULT = "Farley Green (GU5 0RW)"
+
+
+def _to_iso_z(dt: datetime) -> str:
+    return dt.replace(microsecond=0).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+async def _drive_or_fallback(
+    client, origin: str, destination: str, depart_at_iso: str, fallback_min: int
+) -> dict[str, Any]:
+    """drive_time but never raises — fallbacks to a static estimate on error."""
+    try:
+        return await drive_route(client, origin, destination, depart_at=depart_at_iso)
+    except DriveError as e:
+        return {
+            "ok": False,
+            "duration_minutes": fallback_min,
+            "error": str(e),
+            "fallback": True,
+            "origin": origin,
+            "destination": destination,
+        }
+
+
+async def build_eurotunnel(
+    ctx, dest: dict, depart_dt: datetime,
+    origin: str = ORIGIN_HOME_DEFAULT, origin_label: str = ORIGIN_HOME_LABEL_DEFAULT,
+) -> dict[str, Any]:
+    """Drive home → Folkestone → crossing → Calais → drive to destination."""
+    home_to_folkestone_depart = depart_dt
+    drive_to_folkestone = await _drive_or_fallback(
+        ctx["client"], origin, "Folkestone Eurotunnel Terminal",
+        _to_iso_z(home_to_folkestone_depart), fallback_min=95,
+    )
+    drive_min_uk = int(round(drive_to_folkestone["duration_minutes"]))
+
+    arrive_folkestone = depart_dt + timedelta(minutes=drive_min_uk)
+    crossing_depart_uk = arrive_folkestone + timedelta(minutes=PREDEPARTURE_BUFFER_MIN)
+    crossing_arrive_fr = crossing_depart_uk + timedelta(minutes=35 + 5)  # 35 crossing + 5 customs
+    # Calais Coquelles → destination (lat/lon)
+    drive_calais = await _drive_or_fallback(
+        ctx["client"],
+        "Calais Eurotunnel Terminal, France",
+        f"{dest['lat']},{dest['lon']}",
+        _to_iso_z(crossing_arrive_fr),
+        fallback_min=200,
+    )
+    drive_min_fr = int(round(drive_calais["duration_minutes"]))
+
+    et = await eurotunnel_check(
+        None, date=depart_dt.strftime("%Y-%m-%d"),
+        time=crossing_depart_uk.strftime("%H:%M"), vehicle="car", passengers=2,
+    )
+
+    door_to_door = drive_min_uk + PREDEPARTURE_BUFFER_MIN + 35 + 5 + drive_min_fr
+    legs = [
+        {"kind": "drive", "from": origin_label, "to": "Folkestone Terminal",
+         "minutes": drive_min_uk, "operator": "self-drive",
+         "note": f"{drive_to_folkestone.get('distance_km','?')} km via M25/M20"
+                 + (" (live traffic)" if not drive_to_folkestone.get("fallback") else " (static estimate)")},
+        {"kind": "wait", "from": "Folkestone Terminal", "to": "Folkestone Terminal",
+         "minutes": PREDEPARTURE_BUFFER_MIN, "note": "60-min pre-departure buffer"},
+        {"kind": "crossing", "from": "Folkestone", "to": "Calais Coquelles",
+         "minutes": 40, "operator": "LeShuttle",
+         "booking_url": et.get("booking_url"),
+         "note": "35 min crossing + 5 min customs/disembark"},
+        {"kind": "drive", "from": "Calais Coquelles", "to": dest["display_name"],
+         "minutes": drive_min_fr, "operator": "self-drive",
+         "note": f"{drive_calais.get('distance_km','?')} km via French motorway"
+                 + (" (live traffic)" if not drive_calais.get("fallback") else " (static estimate)")},
+    ]
+    return {
+        "ok": True,
+        "mode": "eurotunnel",
+        "door_to_door_minutes": door_to_door,
+        "transfers": 1,
+        "legs": legs,
+        "data_sources": ["static-timetable",
+                         "google-maps" if not drive_to_folkestone.get("fallback") else "static-fallback",
+                         "google-maps" if not drive_calais.get("fallback") else "static-fallback"],
+        "booking_urls": [et.get("booking_url")],
+        "trade_offs": [
+            "Take your own car — no transfers at the destination, room for luggage.",
+            f"Total drive: {drive_min_uk + drive_min_fr} min ({drive_min_uk} UK + {drive_min_fr} FR).",
+        ],
+        "summary": f"Drive + LeShuttle: {door_to_door} min door-to-door "
+                   f"({drive_min_uk}+{PREDEPARTURE_BUFFER_MIN}+40+{drive_min_fr})",
+    }
+
+
+async def build_eurostar(
+    ctx, region: str, dest: dict, depart_dt: datetime,
+    origin: str = ORIGIN_HOME_DEFAULT, origin_label: str = ORIGIN_HOME_LABEL_DEFAULT,
+) -> dict[str, Any]:
+    home_to_stp_depart = depart_dt
+    drive_to_stp = await _drive_or_fallback(
+        ctx["client"], origin, "St Pancras International, London",
+        _to_iso_z(home_to_stp_depart), fallback_min=95,
+    )
+    drive_min_uk = int(round(drive_to_stp["duration_minutes"]))
+
+    es_dest = REGION_EUROSTAR.get(region, "paris")
+    es = await eurostar_check(None, "london", es_dest, depart_dt.strftime("%Y-%m-%d"), adults=2)
+
+    direct = es.get("direct", False)
+    if not direct:
+        return {
+            "ok": False,
+            "mode": "eurostar",
+            "error": f"No direct Eurostar to {es.get('to','destination')}; via-Paris+TGV path not yet implemented",
+            "trade_offs": ["Would need SNCF-API key and TGV interchange logic to compute"],
+        }
+
+    # Seasonal filtering — direct routes are sometimes summer-only or
+    # winter-only. Don't return an option for a date outside the window.
+    seasonal = es.get("seasonal")
+    if isinstance(seasonal, str):
+        m = depart_dt.month
+        in_window = True
+        s_lower = seasonal.lower()
+        if "summer" in s_lower or ("may" in s_lower and "sep" in s_lower):
+            in_window = 5 <= m <= 9
+        elif "winter" in s_lower or "dec" in s_lower:
+            in_window = m == 12 or m <= 4
+        if not in_window:
+            return {
+                "ok": False,
+                "mode": "eurostar",
+                "error": f"Direct {es.get('to')} Eurostar is {seasonal}; not running on {depart_dt.date()}",
+                "trade_offs": ["Use the Paris/Lille interchange path (not yet implemented), or pick another mode."],
+            }
+
+    train_min = es.get("minutes") or 180
+    # Final drive at destination (Eurostar arrival station → user's lat/lon)
+    arrive_dest_station = depart_dt + timedelta(minutes=drive_min_uk + PREDEPARTURE_BUFFER_MIN + train_min)
+    drive_dest = await _drive_or_fallback(
+        ctx["client"],
+        f"{es.get('to','Paris')}, France",
+        f"{dest['lat']},{dest['lon']}",
+        _to_iso_z(arrive_dest_station),
+        fallback_min=30,
+    )
+    drive_min_dest = int(round(drive_dest["duration_minutes"]))
+
+    door_to_door = drive_min_uk + PREDEPARTURE_BUFFER_MIN + train_min + drive_min_dest
+    legs = [
+        {"kind": "drive", "from": origin_label, "to": "St Pancras International",
+         "minutes": drive_min_uk, "operator": "self-drive",
+         "note": f"{drive_to_stp.get('distance_km','?')} km"
+                 + (" (live traffic)" if not drive_to_stp.get("fallback") else " (static estimate)")},
+        {"kind": "wait", "from": "St Pancras", "to": "St Pancras",
+         "minutes": PREDEPARTURE_BUFFER_MIN, "note": "60-min pre-departure (security + customs)"},
+        {"kind": "train", "from": "London St Pancras", "to": es.get("to"),
+         "minutes": train_min, "operator": "Eurostar",
+         "booking_url": es.get("booking_url"),
+         "note": f"{es.get('frequency','?')}{(' — '+es['seasonal']) if es.get('seasonal') else ''}"},
+        {"kind": "drive", "from": es.get("to"), "to": dest["display_name"],
+         "minutes": drive_min_dest, "operator": "taxi/hire",
+         "note": f"{drive_dest.get('distance_km','?')} km"
+                 + (" (live traffic)" if not drive_dest.get("fallback") else " (static estimate)")},
+    ]
+    return {
+        "ok": True,
+        "mode": "eurostar",
+        "door_to_door_minutes": door_to_door,
+        "transfers": 1,
+        "legs": legs,
+        "data_sources": ["static-timetable",
+                         "google-maps" if not drive_to_stp.get("fallback") else "static-fallback",
+                         "google-maps" if not drive_dest.get("fallback") else "static-fallback"],
+        "booking_urls": [es.get("booking_url")],
+        "trade_offs": [
+            f"Direct Eurostar — no airport hassle.",
+            f"Taxi/hire at destination ({drive_min_dest} min) is the friction.",
+            *(["Seasonal: " + es["seasonal"]] if es.get("seasonal") else []),
+        ],
+        "summary": f"Eurostar: {door_to_door} min door-to-door "
+                   f"({drive_min_uk}+{PREDEPARTURE_BUFFER_MIN}+{train_min}+{drive_min_dest})",
+    }
+
+
+async def build_flight(
+    ctx, region: str, dest: dict, depart_dt: datetime, alps_geneva: bool = False,
+    origin: str = ORIGIN_HOME_DEFAULT, origin_label: str = ORIGIN_HOME_LABEL_DEFAULT,
+    dest_iata_override: str | None = None,
+) -> dict[str, Any]:
+    airports = REGION_AIRPORTS.get(region) or {"origin": ["LGW"], "destination": ["CDG"]}
+    origin_iata = airports["origin"][0]
+    if dest_iata_override:
+        dest_iata = dest_iata_override
+    elif alps_geneva:
+        dest_iata = "GVA"
+    else:
+        dest_iata = airports["destination"][0]
+
+    # Drive home → origin airport
+    drive_to_apt = await _drive_or_fallback(
+        ctx["client"], origin,
+        f"{origin_iata} airport",
+        _to_iso_z(depart_dt), fallback_min=60,
+    )
+    drive_min_uk = int(round(drive_to_apt["duration_minutes"]))
+
+    # Flight via Duffel
+    try:
+        offers = await search_offers(
+            ctx["client"], origin_iata, dest_iata,
+            depart_dt.strftime("%Y-%m-%d"), adults=2, cabin="economy",
+        )
+        cheapest = offers["offers"][0] if offers.get("offers") else None
+        if not cheapest:
+            return {"ok": False, "mode": "flight", "error": f"no Duffel offers {origin_iata}→{dest_iata}"}
+        # ISO 8601 duration parser — Duffel returns 'PT2H5M' style
+        flight_min = _parse_iso_duration_min(cheapest["slices"][0]["duration"])
+        flight_carrier = cheapest["owner"]
+        flight_price = cheapest["total_amount"]
+        flight_currency = cheapest["total_currency"]
+    except Exception as e:
+        return {"ok": False, "mode": "flight" + ("/geneva-drive" if alps_geneva else ""),
+                "error": f"flight lookup failed: {type(e).__name__}: {str(e)[:200]}"}
+
+    # Drive at destination
+    arrive_apt = depart_dt + timedelta(minutes=drive_min_uk + AIRPORT_OVERHEAD_MIN + flight_min + 30)
+    drive_dest = await _drive_or_fallback(
+        ctx["client"],
+        f"{dest_iata} airport",
+        f"{dest['lat']},{dest['lon']}",
+        _to_iso_z(arrive_apt),
+        fallback_min=60 if alps_geneva else 30,
+    )
+    drive_min_dest = int(round(drive_dest["duration_minutes"]))
+
+    door_to_door = drive_min_uk + AIRPORT_OVERHEAD_MIN + flight_min + 30 + drive_min_dest
+    mode = "fly_geneva_drive" if alps_geneva else "flight"
+    legs = [
+        {"kind": "drive", "from": origin_label, "to": f"{origin_iata} airport",
+         "minutes": drive_min_uk, "operator": "self-drive",
+         "note": f"{drive_to_apt.get('distance_km','?')} km"
+                 + (" (live traffic)" if not drive_to_apt.get("fallback") else " (static estimate)")},
+        {"kind": "wait", "from": f"{origin_iata} airport", "to": f"{origin_iata} airport",
+         "minutes": AIRPORT_OVERHEAD_MIN, "note": "Check-in + security + walk to gate"},
+        {"kind": "flight", "from": origin_iata, "to": dest_iata,
+         "minutes": flight_min, "operator": flight_carrier,
+         "booking_url": offers.get("booking_deeplink"),
+         "note": f"£{flight_price} {flight_currency} (cheapest of {len(offers['offers'])} offers)"},
+        {"kind": "wait", "from": f"{dest_iata} airport", "to": f"{dest_iata} airport",
+         "minutes": 30, "note": "Disembark + baggage + walk to car"},
+        {"kind": "drive", "from": f"{dest_iata} airport", "to": dest["display_name"],
+         "minutes": drive_min_dest, "operator": "hire car / taxi",
+         "note": f"{drive_dest.get('distance_km','?')} km"
+                 + (" (live traffic)" if not drive_dest.get("fallback") else " (static estimate)")},
+    ]
+    return {
+        "ok": True,
+        "mode": mode,
+        "door_to_door_minutes": door_to_door,
+        "transfers": 2,
+        "legs": legs,
+        "data_sources": [
+            "duffel-test" if not offers.get("live") else "duffel-live",
+            "google-maps" if not drive_to_apt.get("fallback") else "static-fallback",
+            "google-maps" if not drive_dest.get("fallback") else "static-fallback",
+        ],
+        "booking_urls": [offers.get("booking_deeplink")],
+        "trade_offs": [
+            f"Cheapest flight {flight_carrier} £{flight_price}.",
+            f"Airport overhead: {AIRPORT_OVERHEAD_MIN}+30 = {AIRPORT_OVERHEAD_MIN+30} min terminal time.",
+            *(["Hire car at destination."] if alps_geneva or drive_min_dest > 30 else []),
+        ],
+        "summary": f"Fly {origin_iata}→{dest_iata}: {door_to_door} min door-to-door, £{flight_price}.",
+        "total_cost_gbp": flight_price,
+    }
+
+
+def _parse_iso_duration_min(s: str) -> int:
+    """Parse 'PT2H5M' / 'PT45M' / 'PT3H' to minutes."""
+    if not s or not s.startswith("PT"):
+        return 0
+    total = 0
+    cur = ""
+    for ch in s[2:]:
+        if ch.isdigit():
+            cur += ch
+        elif ch == "H":
+            total += int(cur) * 60
+            cur = ""
+        elif ch == "M":
+            total += int(cur)
+            cur = ""
+    return total
+
+
+async def build_multiday_drive(
+    ctx, dest: dict, depart_dt: datetime, overnight_near: str,
+    origin: str = ORIGIN_HOME_DEFAULT, origin_label: str = ORIGIN_HOME_LABEL_DEFAULT,
+) -> dict[str, Any]:
+    """Drive day 1 to an overnight stop, drive day 2 to the destination.
+
+    Day 1 = home → Eurotunnel → overnight_near (uses the same chain as
+    build_eurotunnel with overnight_near as the day's destination).
+    Day 2 = overnight_near → destination (drive_time only).
+    """
+    overnight_geo = await forward_geocode(ctx["client"], ctx["pool"], pool_locations=ctx.get("pool_locations"), query=overnight_near)
+    if not overnight_geo:
+        return {
+            "ok": False, "mode": "multiday-drive",
+            "error": f"could not geocode overnight_near={overnight_near!r}",
+        }
+
+    fake_dest = {
+        "lat": overnight_geo["lat"], "lon": overnight_geo["lon"],
+        "display_name": overnight_geo["display_name"],
+    }
+    day1 = await build_eurotunnel(
+        ctx, fake_dest, depart_dt, origin=origin, origin_label=origin_label,
+    )
+    if not day1.get("ok"):
+        return {
+            "ok": False, "mode": "multiday-drive",
+            "error": f"day-1 leg failed: {day1.get('error','?')}",
+        }
+
+    # Day 2 — assume morning departure ~24h after day 1's start
+    day2_depart = depart_dt + timedelta(hours=24)
+    day2_drive = await _drive_or_fallback(
+        ctx["client"],
+        f"{overnight_geo['lat']},{overnight_geo['lon']}",
+        f"{dest['lat']},{dest['lon']}",
+        _to_iso_z(day2_depart), fallback_min=300,
+    )
+    day2_min = int(round(day2_drive["duration_minutes"]))
+
+    legs = list(day1["legs"]) + [
+        {
+            "kind": "overnight",
+            "from": overnight_geo["display_name"],
+            "to": overnight_geo["display_name"],
+            "minutes": 0,
+            "note": f"Overnight stop in {overnight_near}",
+        },
+        {
+            "kind": "drive",
+            "from": overnight_geo["display_name"],
+            "to": dest["display_name"],
+            "minutes": day2_min,
+            "operator": "self-drive",
+            "note": f"{day2_drive.get('distance_km','?')} km, day 2"
+                    + (" (live traffic)" if not day2_drive.get("fallback") else " (static estimate)"),
+        },
+    ]
+    door_to_door = day1["door_to_door_minutes"] + day2_min
+    return {
+        "ok": True,
+        "mode": "multiday-drive",
+        "door_to_door_minutes": door_to_door,
+        "transfers": 1,
+        "legs": legs,
+        "data_sources": list(day1.get("data_sources", [])) + [
+            "google-maps" if not day2_drive.get("fallback") else "static-fallback",
+        ],
+        "booking_urls": list(day1.get("booking_urls", [])),
+        "trade_offs": [
+            f"Two-day drive — overnight at {overnight_geo['display_name']}.",
+            f"Day 1 ~{day1['door_to_door_minutes']} min ({day1['door_to_door_minutes']//60}h{day1['door_to_door_minutes']%60:02d}m). "
+            f"Day 2 ~{day2_min} min ({day2_min//60}h{day2_min%60:02d}m).",
+        ],
+        "summary": (
+            f"Multi-day drive via {overnight_near}: "
+            f"day1 {day1['door_to_door_minutes']} min + day2 {day2_min} min "
+            f"= {door_to_door} min total"
+        ),
+        "overnight": {
+            "near": overnight_near,
+            "resolved": overnight_geo["display_name"],
+            "lat": overnight_geo["lat"],
+            "lon": overnight_geo["lon"],
+        },
+    }
+
+
+async def plan_trip_impl(
+    ctx, destination: str, depart_date: str,
+    return_date: str | None = None, party: list[str] | None = None,
+    depart_time: str = "08:00", max_options: int = 6,
+    origin: str | None = None, origin_label: str | None = None,
+    fly_only: bool = False, dest_airports: list[str] | None = None,
+    overnight_near: str | None = None,
+    prefer_affiliation: str | None = None,
+) -> dict[str, Any]:
+    origin = origin or ORIGIN_HOME_DEFAULT
+    origin_label = origin_label or origin
+    # 1. Geocode destination
+    geo = await forward_geocode(ctx["client"], ctx["pool"], pool_locations=ctx.get("pool_locations"), query=destination)
+    if not geo:
+        return {"ok": False, "error": f"could not geocode destination {destination!r}"}
+
+    # 2. Classify region
+    region = classify_region(geo["lat"], geo["lon"], query=destination)
+
+    # 3. Resolve party defaults
+    if party is None:
+        async with ctx["pool"].acquire() as conn:
+            rows = await conn.fetch("SELECT name FROM party_member WHERE is_default=true ORDER BY id")
+            party = [r["name"] for r in rows]
+
+    # 4. Pick mode set
+    modes = REGION_MODES.get(region, ["eurotunnel", "flight"])
+    if fly_only:
+        modes = [m for m in modes if m in ("flight", "fly_geneva_drive")]
+        if not modes:
+            modes = ["flight"]   # ensure at least one flight option for fly_only requests
+    if not modes:
+        return {"ok": False, "error": f"region {region!r} has no candidate modes"}
+
+    # 5. Build options concurrently
+    depart_dt = datetime.fromisoformat(f"{depart_date}T{depart_time}:00").replace(tzinfo=timezone.utc)
+    # Resolve flight destination airports — explicit override > region default
+    region_aps = REGION_AIRPORTS.get(region) or {"origin": ["LGW"], "destination": ["CDG"]}
+    flight_dests = dest_airports or region_aps.get("destination", ["CDG"])
+
+    tasks = []
+    for m in modes:
+        if m == "eurotunnel":
+            tasks.append(("eurotunnel",
+                          build_eurotunnel(ctx, geo, depart_dt, origin=origin, origin_label=origin_label)))
+        elif m == "eurostar":
+            tasks.append(("eurostar",
+                          build_eurostar(ctx, region, geo, depart_dt, origin=origin, origin_label=origin_label)))
+        elif m == "flight":
+            for ap in flight_dests:
+                tasks.append((f"flight_{ap}",
+                              build_flight(ctx, region, geo, depart_dt, alps_geneva=False,
+                                           origin=origin, origin_label=origin_label,
+                                           dest_iata_override=ap)))
+        elif m == "fly_geneva_drive":
+            tasks.append(("fly_geneva_drive",
+                          build_flight(ctx, region, geo, depart_dt, alps_geneva=True,
+                                       origin=origin, origin_label=origin_label)))
+
+    # Optional multi-day-drive option triggered by overnight_near
+    if overnight_near and not fly_only:
+        tasks.append(("multiday-drive",
+                      build_multiday_drive(ctx, geo, depart_dt, overnight_near,
+                                           origin=origin, origin_label=origin_label)))
+
+    raw = await asyncio.gather(*[t for _, t in tasks], return_exceptions=True)
+    options = []
+    for (mode_name, _), result in zip(tasks, raw):
+        if isinstance(result, BaseException):
+            options.append({"ok": False, "mode": mode_name,
+                            "error": f"{type(result).__name__}: {result}"})
+        else:
+            result["confidence"] = confidence(result)
+            options.append(result)
+
+    # 6. Rank
+    options.sort(key=score)
+    options = options[:max_options]
+
+    # 6b. Optional accommodation suggestions via affiliation_search
+    accommodation = None
+    if prefer_affiliation:
+        from mcp_search.travel_affiliations import VALID_TAGS, filter_by as _affiliations_filter
+        from mcp_search.travel_drive import drive_time as _drive
+        aff = prefer_affiliation.upper()
+        if aff in VALID_TAGS:
+            # If overnight specified, search near it; otherwise near destination
+            anchor_query = overnight_near or destination
+            anchor_geo = await forward_geocode(ctx["client"], ctx["pool"], pool_locations=ctx.get("pool_locations"), query=anchor_query)
+            if anchor_geo:
+                cands = _affiliations_filter(affiliation=aff)
+                # rank by direct distance to anchor (fast — avoids extra API calls)
+                from math import asin, cos, radians, sin, sqrt
+                def _haversine_km(lat1, lon1, lat2, lon2):
+                    R = 6371.0
+                    dlat = radians(lat2 - lat1); dlon = radians(lon2 - lon1)
+                    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+                    return 2 * R * asin(sqrt(a))
+                near = sorted(
+                    [{"hotel": h, "km": _haversine_km(anchor_geo["lat"], anchor_geo["lon"], h["lat"], h["lon"])}
+                     for h in cands],
+                    key=lambda x: x["km"],
+                )[:5]
+                accommodation = {
+                    "affiliation": aff,
+                    "anchor": anchor_query,
+                    "anchor_resolved": anchor_geo["display_name"],
+                    "candidates": [
+                        {**c["hotel"], "distance_km_from_anchor": round(c["km"], 1)}
+                        for c in near
+                    ],
+                    "note": "Use affiliation_search for drive-time-validated routing.",
+                }
+
+    payload = {
+        "ok": True,
+        "destination": destination,
+        "destination_resolved": geo["display_name"],
+        "destination_lat": geo["lat"],
+        "destination_lon": geo["lon"],
+        "destination_country": geo.get("country_code"),
+        "region": region,
+        "modes_considered": modes,
+        "depart_date": depart_date,
+        "return_date": return_date,
+        "party": party,
+        "options": options,
+        "best": options[0]["summary"] if options and options[0].get("ok") else None,
+        "overnight_near": overnight_near,
+        "accommodation_suggestions": accommodation,
+    }
+
+    # 7. Persist to journey_log
+    try:
+        depart_d = date_type.fromisoformat(depart_date)
+        return_d = date_type.fromisoformat(return_date) if return_date else None
+        async with ctx["pool"].acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO journey_log (destination, depart_date, return_date, party, result)
+                VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+                """,
+                destination,
+                depart_d,
+                return_d,
+                json.dumps(party),
+                json.dumps(payload),
+            )
+    except Exception as e:
+        payload["journey_log_error"] = str(e)
+
+    return payload

@@ -1,0 +1,794 @@
+"""MCP server: door-to-door trip planning across flight, rail, and Eurotunnel.
+
+Phases 1–4 implemented (2026-05-03):
+  - flight_check        — Duffel offers (test mode unless DUFFEL_MODE=live)
+  - sncf_journey        — SNCF Navitia journeys (needs SNCF_API_KEY)
+  - eurostar_check      — Playwright scraper, fail-soft (selectors WIP)
+  - eurotunnel_check    — Playwright scraper, fail-soft (selectors WIP)
+  - compare_modes       — parallel fan-out across the above
+
+Phase 5 (plan_trip + ranking + sbb/uk_trains composition) and beyond:
+see /root/.claude/plans/brief-mcp-travel-steady-fountain.md.
+"""
+
+import asyncio
+import json
+import os
+from datetime import date as date_type
+from typing import Any
+
+import asyncpg
+import httpx
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_context
+from fastmcp.server.lifespan import lifespan
+
+from mcp_search.travel_affiliations import VALID_TAGS, filter_by as affiliations_filter_by
+from mcp_search.travel_cache import cache_get, cache_set
+from mcp_search.travel_drive import DriveError, drive_time as drive_route
+from mcp_search.travel_duffel import DuffelError, search_offers
+from mcp_search.travel_eurostar import EurostarError, check as eurostar_scrape
+from mcp_search.travel_eurotunnel import EurotunnelError, check as eurotunnel_scrape
+from mcp_search.travel_hotels import search as hotels_search
+from mcp_search.travel_plan import plan_trip_impl
+from mcp_search.travel_sncf import SncfError, search_journey as sncf_search
+
+_TTL_FLIGHTS = 6 * 3600
+_TTL_RAIL = 12 * 3600
+_TTL_SCRAPER = 24 * 3600
+_TTL_DRIVE = 15 * 60      # traffic conditions stale after ~15 min
+_TTL_HOTELS = 30 * 60     # offers slightly volatile but session-stable
+
+
+@lifespan
+async def travel_lifespan(server):
+    dsn = os.environ["TRAVEL_DB_DSN"]
+    sslmode = os.environ.get("TRAVEL_DB_SSLMODE", "prefer")
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4, ssl=sslmode)
+
+    # Second pool for read-only access to Stu's mylocation.place — used
+    # by travel_geocode.forward_geocode as a first-look named-place
+    # lookup before hitting Nominatim. Optional: fails-soft if the
+    # mcp_readonly password isn't injected.
+    pool_loc = None
+    ro_pw = os.environ.get("MCP_READONLY_PASSWORD")
+    if ro_pw:
+        try:
+            pool_loc = await asyncpg.create_pool(
+                host=os.environ.get("POSTGRES_HOST", "postgres"),
+                port=int(os.environ.get("POSTGRES_PORT", "5432")),
+                user="mcp_readonly",
+                password=ro_pw,
+                database="mylocation",
+                min_size=1, max_size=2,
+                ssl=sslmode,
+            )
+        except Exception:
+            pool_loc = None
+
+    client = httpx.AsyncClient(timeout=30.0)
+    # Playwright was here (Phase 3) for Eurostar / LeShuttle scraping;
+    # removed 2026-05-03 in favour of static durations. The eurostar /
+    # eurotunnel modules accept a `browser` arg they ignore so the
+    # signatures stay stable if scrapers come back.
+    try:
+        yield {"pool": pool, "client": client, "browser": None, "pool_locations": pool_loc}
+    finally:
+        await client.aclose()
+        if pool_loc is not None:
+            await pool_loc.close()
+        await pool.close()
+
+
+mcp = FastMCP("travel", lifespan=travel_lifespan)
+
+
+def _ctx():
+    return get_context().lifespan_context
+
+
+# --- Per-tool impl helpers (return dicts; tool wrappers json.dumps) ---
+
+
+async def _flight_impl(
+    ctx: dict, origin_iata: str, dest_iata: str, date: str, cabin: str, adults: int
+) -> dict[str, Any]:
+    origin = origin_iata.upper().strip()
+    dest = dest_iata.upper().strip()
+    args = {"origin": origin, "destination": dest, "date": date, "cabin": cabin, "adults": adults}
+    bucket = date_type.fromisoformat(date)
+
+    cached = await cache_get(ctx["pool"], "flight_check", args, bucket)
+    if cached is not None:
+        cached["cached"] = True
+        return cached
+
+    try:
+        result = await search_offers(ctx["client"], origin, dest, date, adults=adults, cabin=cabin)
+    except DuffelError as e:
+        return {
+            "ok": False,
+            "mode": "flight",
+            "error": str(e),
+            "origin": origin,
+            "destination": dest,
+            "date": date,
+        }
+
+    await cache_set(ctx["pool"], "flight_check", args, bucket, result, _TTL_FLIGHTS)
+    result["cached"] = False
+    return result
+
+
+async def _sncf_impl(
+    ctx: dict, origin: str, destination: str, datetime_iso: str, max_journeys: int
+) -> dict[str, Any]:
+    args = {
+        "origin": origin,
+        "destination": destination,
+        "datetime": datetime_iso,
+        "max_journeys": max_journeys,
+    }
+    bucket = date_type.fromisoformat(datetime_iso.split("T", 1)[0])
+
+    cached = await cache_get(ctx["pool"], "sncf_journey", args, bucket)
+    if cached is not None:
+        cached["cached"] = True
+        return cached
+
+    try:
+        result = await sncf_search(
+            ctx["client"], origin, destination, datetime_iso, max_journeys=max_journeys
+        )
+    except SncfError as e:
+        return {
+            "ok": False,
+            "mode": "rail",
+            "error": str(e),
+            "origin": origin,
+            "destination": destination,
+            "datetime": datetime_iso,
+        }
+
+    await cache_set(ctx["pool"], "sncf_journey", args, bucket, result, _TTL_RAIL)
+    result["cached"] = False
+    return result
+
+
+async def _eurostar_impl(
+    ctx: dict, origin_city: str, dest_city: str, date: str, adults: int
+) -> dict[str, Any]:
+    args = {"origin": origin_city, "dest": dest_city, "date": date, "adults": adults}
+    bucket = date_type.fromisoformat(date)
+
+    cached = await cache_get(ctx["pool"], "eurostar_check", args, bucket)
+    if cached is not None:
+        cached["cached"] = True
+        return cached
+
+    try:
+        result = await eurostar_scrape(ctx.get("browser"), origin_city, dest_city, date, adults=adults)
+    except EurostarError as e:
+        return {
+            "ok": False,
+            "mode": "eurostar",
+            "error": str(e),
+            "origin": origin_city,
+            "destination": dest_city,
+            "date": date,
+        }
+
+    await cache_set(ctx["pool"], "eurostar_check", args, bucket, result, _TTL_SCRAPER)
+    result["cached"] = False
+    return result
+
+
+async def _drive_impl(
+    ctx: dict, origin: str, destination: str, depart_at: str | None,
+    traffic_model: str, avoid_tolls: bool
+) -> dict[str, Any]:
+    args = {
+        "origin": origin,
+        "destination": destination,
+        "depart_at": depart_at or "",
+        "traffic_model": traffic_model,
+        "avoid_tolls": avoid_tolls,
+    }
+    # Date bucket = the depart date (or today if not specified) — keeps
+    # 'tomorrow at 8am' separate from 'next week at 8am' in the cache.
+    if depart_at:
+        bucket = date_type.fromisoformat(depart_at[:10])
+    else:
+        bucket = date_type.today()
+
+    cached = await cache_get(ctx["pool"], "drive_time", args, bucket)
+    if cached is not None:
+        cached["cached"] = True
+        return cached
+
+    try:
+        result = await drive_route(
+            ctx["client"], origin, destination,
+            depart_at=depart_at, traffic_model=traffic_model, avoid_tolls=avoid_tolls,
+        )
+    except DriveError as e:
+        return {
+            "ok": False,
+            "mode": "drive",
+            "error": str(e),
+            "origin": origin,
+            "destination": destination,
+            "depart_at": depart_at,
+        }
+
+    await cache_set(ctx["pool"], "drive_time", args, bucket, result, _TTL_DRIVE)
+    result["cached"] = False
+    return result
+
+
+async def _eurotunnel_impl(
+    ctx: dict, date: str, time: str, vehicle: str, passengers: int
+) -> dict[str, Any]:
+    args = {"date": date, "time": time, "vehicle": vehicle, "passengers": passengers}
+    bucket = date_type.fromisoformat(date)
+
+    cached = await cache_get(ctx["pool"], "eurotunnel_check", args, bucket)
+    if cached is not None:
+        cached["cached"] = True
+        return cached
+
+    try:
+        result = await eurotunnel_scrape(
+            ctx.get("browser"), date=date, time=time, vehicle=vehicle, passengers=passengers
+        )
+    except EurotunnelError as e:
+        return {
+            "ok": False,
+            "mode": "eurotunnel",
+            "error": str(e),
+            "date": date,
+            "time": time,
+            "vehicle": vehicle,
+        }
+
+    await cache_set(ctx["pool"], "eurotunnel_check", args, bucket, result, _TTL_SCRAPER)
+    result["cached"] = False
+    return result
+
+
+# --- MCP tools ---
+
+
+@mcp.tool()
+async def travel_flight_check(
+    origin_iata: str,
+    dest_iata: str,
+    date: str,
+    cabin: str = "economy",
+    adults: int = 2,
+) -> str:
+    """Find flight offers between two airports on a date.
+
+    Args:
+        origin_iata: IATA code of origin airport (e.g. 'LGW', 'LHR').
+        dest_iata: IATA code of destination airport (e.g. 'NCE', 'GVA').
+        date: Departure date in ISO format (YYYY-MM-DD).
+        cabin: Cabin class — 'economy', 'premium_economy', 'business', 'first'.
+        adults: Number of adult passengers (default 2).
+
+    Returns up to 5 offers ranked by price plus a Skyscanner deeplink as
+    a booking fallback. Uses Duffel test mode unless DUFFEL_MODE=live.
+    """
+    return json.dumps(
+        await _flight_impl(_ctx(), origin_iata, dest_iata, date, cabin, adults), indent=2
+    )
+
+
+@mcp.tool()
+async def travel_sncf_journey(
+    origin: str,
+    destination: str,
+    datetime_iso: str,
+    max_journeys: int = 5,
+) -> str:
+    """Plan a French rail journey via the SNCF Navitia API.
+
+    Inputs accept free-text place names ('Paris Gare de Lyon'), Navitia IDs
+    ('stop_area:SNCF:87686006'), or 'lat;lon' coords. Live pricing is **not**
+    in the SNCF API — `booking_deeplink` jumps to sncf-connect.com.
+    """
+    return json.dumps(
+        await _sncf_impl(_ctx(), origin, destination, datetime_iso, max_journeys), indent=2
+    )
+
+
+@mcp.tool()
+async def travel_eurostar_check(
+    origin_city: str,
+    dest_city: str,
+    date: str,
+    adults: int = 2,
+) -> str:
+    """Get the lowest GBP fare for a Eurostar route on a date (scraper).
+
+    Stations: 'london'/'ashford'/'ebbsfleet' → 'paris'/'lille'/'brussels'/
+    'amsterdam'/'rotterdam'/'disneyland'. Cache TTL 24h.
+    """
+    return json.dumps(
+        await _eurostar_impl(_ctx(), origin_city, dest_city, date, adults), indent=2
+    )
+
+
+@mcp.tool()
+async def travel_eurotunnel_check(
+    date: str,
+    time: str = "10:00",
+    vehicle: str = "car",
+    passengers: int = 2,
+) -> str:
+    """Get the lowest GBP fare for a LeShuttle (Eurotunnel) crossing.
+
+    Folkestone → Calais Coquelles only. Vehicle 'car'/'high-vehicle'/
+    'caravan-trailer'/'motorhome'/'motorcycle' (aliases accepted).
+    Cache TTL 24h.
+    """
+    return json.dumps(
+        await _eurotunnel_impl(_ctx(), date, time, vehicle, passengers), indent=2
+    )
+
+
+@mcp.tool()
+async def travel_drive_time(
+    origin: str,
+    destination: str,
+    depart_at: str | None = None,
+    traffic_model: str = "aware",
+    avoid_tolls: bool = False,
+) -> str:
+    """Traffic-aware drive time via Google Maps Routes API.
+
+    Args:
+        origin: Address, postcode, or 'lat,lon' coords (e.g. 'GU5 0RW',
+                'Farley Green, UK', '51.218,-0.461').
+        destination: Same forms.
+        depart_at: ISO datetime (e.g. '2026-05-04T05:45:00Z'). Defaults to
+                   ~now (5 min in the future). Future timestamps are
+                   required for traffic-aware ETAs to apply.
+        traffic_model: 'aware' (default, fast, cheap) or 'optimal' (slower,
+                       more accurate, more expensive) or 'static' (no
+                       traffic, road network only).
+        avoid_tolls: If True, route avoids toll roads.
+
+    Returns duration_minutes (traffic-aware), static_duration_minutes (no
+    traffic), traffic_delay_minutes (the difference), and distance.
+    Cache TTL is 15 min — traffic is volatile but stable within a planning
+    session. The cache key includes the depart_at date so tomorrow's 8am
+    drive is cached separately from next week's 8am drive.
+    """
+    return json.dumps(
+        await _drive_impl(
+            _ctx(), origin, destination, depart_at, traffic_model, avoid_tolls
+        ),
+        indent=2,
+    )
+
+
+@mcp.tool()
+async def travel_compare_modes(
+    date: str,
+    flight: dict | None = None,
+    eurostar: dict | None = None,
+    eurotunnel: dict | None = None,
+    sncf: dict | None = None,
+) -> str:
+    """Run multiple modes in parallel and return a side-by-side comparison.
+
+    Pass per-mode argument dicts; each runs concurrently with fail-soft.
+    A single dead mode does not kill the others. Per-tool caching applies
+    transparently so repeat calls are cheap.
+
+    Args:
+        date: ISO date for the trip (YYYY-MM-DD). Some modes need a more
+              specific datetime (sncf) — pass it inside that mode's dict.
+        flight: e.g. {"origin_iata": "LGW", "dest_iata": "NCE",
+                      "cabin": "economy", "adults": 2}
+        eurostar: e.g. {"origin_city": "london", "dest_city": "paris",
+                        "adults": 2}
+        eurotunnel: e.g. {"time": "10:00", "vehicle": "car",
+                          "passengers": 2}
+        sncf: e.g. {"origin": "Paris Gare de Lyon",
+                    "destination": "Avignon TGV",
+                    "datetime_iso": "2026-06-15T09:00",
+                    "max_journeys": 5}
+
+    Returns:
+        JSON dict {date, requested: [...], results: {mode: <result_dict>}}
+        where each result_dict is the same shape as the equivalent
+        single-mode tool, including ok/error fields on failure.
+    """
+    ctx = _ctx()
+    tasks: dict[str, Any] = {}
+
+    if flight is not None:
+        tasks["flight"] = _flight_impl(
+            ctx,
+            origin_iata=flight["origin_iata"],
+            dest_iata=flight["dest_iata"],
+            date=flight.get("date", date),
+            cabin=flight.get("cabin", "economy"),
+            adults=flight.get("adults", 2),
+        )
+
+    if eurostar is not None:
+        tasks["eurostar"] = _eurostar_impl(
+            ctx,
+            origin_city=eurostar["origin_city"],
+            dest_city=eurostar["dest_city"],
+            date=eurostar.get("date", date),
+            adults=eurostar.get("adults", 2),
+        )
+
+    if eurotunnel is not None:
+        tasks["eurotunnel"] = _eurotunnel_impl(
+            ctx,
+            date=eurotunnel.get("date", date),
+            time=eurotunnel.get("time", "10:00"),
+            vehicle=eurotunnel.get("vehicle", "car"),
+            passengers=eurotunnel.get("passengers", 2),
+        )
+
+    if sncf is not None:
+        tasks["sncf"] = _sncf_impl(
+            ctx,
+            origin=sncf["origin"],
+            destination=sncf["destination"],
+            datetime_iso=sncf["datetime_iso"],
+            max_journeys=sncf.get("max_journeys", 5),
+        )
+
+    if not tasks:
+        return json.dumps(
+            {"ok": False, "error": "no modes requested; pass at least one of flight/eurostar/eurotunnel/sncf"},
+            indent=2,
+        )
+
+    keys = list(tasks.keys())
+    raw = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    results: dict[str, Any] = {}
+    for k, r in zip(keys, raw):
+        if isinstance(r, BaseException):
+            results[k] = {
+                "ok": False,
+                "mode": k,
+                "error": f"{type(r).__name__}: {r}",
+            }
+        else:
+            results[k] = r
+
+    return json.dumps(
+        {"date": date, "requested": keys, "results": results},
+        indent=2,
+    )
+
+
+@mcp.tool()
+async def travel_affiliation_search(
+    affiliation: str = "RC",
+    max_drive_min_from: list | None = None,
+    max_drive_min_to: list | None = None,
+    countries: list[str] | None = None,
+    max_results: int = 12,
+) -> str:
+    """Find hotels in a curated luxury-affiliation list, drive-time validated.
+
+    LiteAPI's hotel inventory doesn't carry boutique-affiliation properties
+    (Relais & Châteaux, Leading Hotels of the World, etc.) reliably — they
+    book through their own channels. This tool consults a curated module
+    list (~40 well-known properties on western-European routes) and adds
+    drive-time validation via Google Maps so you can ask "R&C on the
+    Calais → Tasch route" without LiteAPI inventory gaps biting.
+
+    Args:
+        affiliation: One of 'RC' (Relais & Châteaux), 'LHW' (Leading Hotels),
+                     'SLH' (Small Luxury Hotels), 'CHC' (Châteaux & Hôtels
+                     Collection). Default 'RC'.
+        max_drive_min_from: ['origin', minutes] — drop entries beyond budget
+                            from this point (e.g. ['Calais, France', 480]).
+        max_drive_min_to:   ['destination', minutes] — drop entries that
+                            can't reach this point in budget (e.g. for a
+                            second-day continuation: ['Tasch, Switzerland', 480]).
+        countries: ISO-2 country codes filter (e.g. ['FR','CH']).
+        max_results: cap on returned rows (default 12).
+
+    Each result has name + city + lat/lon + URL (R&C search if no
+    canonical), drive minutes from/to where requested, and the affiliation
+    tag set (a property may carry multiple — e.g. RC+LHW). Bookings happen
+    on the affiliation's own site — there's no live availability or price
+    here, just route validation.
+    """
+    aff = (affiliation or "RC").upper()
+    if aff not in VALID_TAGS:
+        return json.dumps({
+            "ok": False, "error": f"Unknown affiliation {aff!r}; valid: {sorted(VALID_TAGS)}",
+        }, indent=2)
+
+    candidates = affiliations_filter_by(affiliation=aff, countries=countries)
+    if not candidates:
+        return json.dumps({"ok": True, "affiliation": aff, "results": [], "note": "no entries match"}, indent=2)
+
+    client = _ctx()["client"]
+    drive_from_origin = max_drive_min_from[0] if max_drive_min_from else None
+    drive_from_budget = max_drive_min_from[1] if max_drive_min_from else None
+    drive_to_dest = max_drive_min_to[0] if max_drive_min_to else None
+    drive_to_budget = max_drive_min_to[1] if max_drive_min_to else None
+
+    async def _validate(h: dict) -> dict:
+        coord = f"{h['lat']},{h['lon']}"
+        from_min = None
+        to_min = None
+        if drive_from_origin:
+            try:
+                d = await drive_route(client, drive_from_origin, coord, traffic_model="static")
+                from_min = d["duration_minutes"]
+            except DriveError:
+                pass
+        if drive_to_dest:
+            try:
+                d = await drive_route(client, coord, drive_to_dest, traffic_model="static")
+                to_min = d["duration_minutes"]
+            except DriveError:
+                pass
+        return {**h, "drive_from_min": from_min, "drive_to_min": to_min}
+
+    enriched = await asyncio.gather(*[_validate(h) for h in candidates])
+
+    if drive_from_budget is not None:
+        enriched = [h for h in enriched if h["drive_from_min"] is not None
+                                          and h["drive_from_min"] <= drive_from_budget]
+    if drive_to_budget is not None:
+        enriched = [h for h in enriched if h["drive_to_min"] is not None
+                                          and h["drive_to_min"] <= drive_to_budget]
+
+    # Rank: lower max(from, to) is better — keeps days balanced
+    def _score(h):
+        f = h.get("drive_from_min") or 0
+        t = h.get("drive_to_min") or 0
+        return max(f, t) if (drive_from_budget or drive_to_budget) else f or t or 0
+
+    enriched.sort(key=_score)
+
+    return json.dumps({
+        "ok": True,
+        "affiliation": aff,
+        "drive_filter_from": {"origin": drive_from_origin, "max_minutes": drive_from_budget} if drive_from_origin else None,
+        "drive_filter_to":   {"destination": drive_to_dest, "max_minutes": drive_to_budget} if drive_to_dest else None,
+        "candidate_count": len(candidates),
+        "results": enriched[:max_results],
+    }, indent=2)
+
+
+@mcp.tool()
+async def travel_hotel_search(
+    near: str,
+    check_in: str,
+    check_out: str,
+    min_stars: int = 4,
+    pet_friendly: bool = False,
+    max_drive_min_from: list | None = None,
+    max_drive_min_to: list | None = None,
+    chain_contains: str | None = None,
+    radius_km: int = 25,
+    guests: int = 2,
+    max_results: int = 10,
+) -> str:
+    """Search hotels via Amadeus, optionally filtered by drive-time from another point.
+
+    Args:
+        near: City name, place, or 'lat,lon' string. Geocoded via Nominatim.
+        check_in: ISO date (YYYY-MM-DD).
+        check_out: ISO date.
+        min_stars: Minimum star rating (default 4).
+        pet_friendly: If True, filter for the PETS_ALLOWED amenity tag.
+        max_drive_min_from: ['origin', minutes] e.g. ['Calais, France', 180].
+                            Each candidate is checked via drive_time and
+                            dropped if over budget.
+        radius_km: Geocode-search radius around `near` (default 25 km).
+        guests: Adult headcount (default 2).
+        max_results: Cap on returned offers (default 10).
+
+    Returns ranked list of hotels with live Amadeus offers (price, room
+    description, amenities) — sorted by stars desc then price asc.
+    Cache TTL is 30 min — re-running the same query within the session
+    won't re-bill Amadeus.
+    """
+    args = {
+        "near": near, "check_in": check_in, "check_out": check_out,
+        "min_stars": min_stars, "pet_friendly": pet_friendly,
+        "max_drive_min_from": list(max_drive_min_from) if max_drive_min_from else None,
+        "max_drive_min_to": list(max_drive_min_to) if max_drive_min_to else None,
+        "chain_contains": chain_contains,
+        "radius_km": radius_km, "guests": guests, "max_results": max_results,
+    }
+    bucket = date_type.fromisoformat(check_in)
+    cached = await cache_get(_ctx()["pool"], "hotel_search", args, bucket)
+    if cached is not None:
+        cached["cached"] = True
+        return json.dumps(cached, indent=2)
+
+    drive_budget = tuple(max_drive_min_from) if max_drive_min_from else None
+    drive_budget_to = tuple(max_drive_min_to) if max_drive_min_to else None
+    result = await hotels_search(
+        _ctx()["pool"], _ctx()["client"],
+        near=near, check_in=check_in, check_out=check_out,
+        min_stars=min_stars, pet_friendly=pet_friendly,
+        max_drive_min_from=drive_budget, max_drive_min_to=drive_budget_to,
+        chain_contains=chain_contains, radius_km=radius_km,
+        guests=guests, max_results=max_results,
+        pool_locations=_ctx().get("pool_locations"),
+    )
+    if result.get("ok"):
+        await cache_set(_ctx()["pool"], "hotel_search", args, bucket, result, _TTL_HOTELS)
+    result["cached"] = False
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def travel_list_named_places(
+    place_type: str | None = None,
+    name_contains: str | None = None,
+    limit: int = 50,
+) -> str:
+    """List Stu's curated named places from mylocation.place.
+
+    These are the places that resolve instantly in `forward_geocode` (and
+    therefore in `plan_trip` / `hotel_search` / `affiliation_search` too)
+    before we ever hit Nominatim. Useful for the LLM to see what
+    short-form names are recognised — e.g. 'Mum's', 'Diddy's vet', a
+    favoured hotel by nickname.
+
+    Args:
+        place_type: optional filter on place_type.name (Hotel, Restaurant,
+                    Home, Family, Venue, Pub, City, Accommodation, Jazz Club,
+                    Airport, …).
+        name_contains: case-insensitive substring filter on place.name.
+        limit: max rows (default 50).
+    """
+    pool_loc = _ctx().get("pool_locations")
+    if pool_loc is None:
+        return json.dumps({
+            "ok": False,
+            "error": "mylocation pool not initialised — MCP_READONLY_PASSWORD secret not mounted",
+        }, indent=2)
+
+    sql = (
+        "SELECT p.name, pt.name AS place_type, p.lat, p.lon, p.notes, "
+        "       p.date_from, p.date_to "
+        "FROM place p JOIN place_type pt ON p.place_type_id = pt.id WHERE 1=1 "
+    )
+    args: list = []
+    if place_type:
+        args.append(place_type)
+        sql += f"AND pt.name ILIKE ${len(args)} "
+    if name_contains:
+        args.append(f"%{name_contains}%")
+        sql += f"AND (p.name ILIKE ${len(args)} OR p.notes ILIKE ${len(args)}) "
+    args.append(limit)
+    sql += f"ORDER BY pt.name, p.name LIMIT ${len(args)}"
+    async with pool_loc.acquire() as conn:
+        rows = await conn.fetch(sql, *args)
+    out = [
+        {
+            "name": r["name"],
+            "type": r["place_type"],
+            "lat": float(r["lat"]),
+            "lon": float(r["lon"]),
+            "notes": r["notes"],
+            "date_from": r["date_from"].isoformat() if r["date_from"] else None,
+            "date_to": r["date_to"].isoformat() if r["date_to"] else None,
+        }
+        for r in rows
+    ]
+    return json.dumps({"ok": True, "count": len(out), "places": out}, indent=2)
+
+
+@mcp.tool()
+async def travel_recent_trips(
+    limit: int = 10,
+    destination_contains: str | None = None,
+) -> str:
+    """Recent plan_trip queries from the journey_log audit table.
+
+    Useful for retrospectives ("what did we look at for the May trip?")
+    and for ranking-weight tuning. Each row is one plan_trip call with
+    the destination, dates, party, and the chosen 'best' option summary.
+
+    Args:
+        limit: max rows (default 10).
+        destination_contains: case-insensitive substring filter on
+            destination (e.g. 'avignon', 'zermatt').
+    """
+    pool = _ctx()["pool"]
+    sql = (
+        "SELECT id, asked_at, destination, depart_date, return_date, party, "
+        "       result->>'best' AS best, result->>'region' AS region "
+        "FROM journey_log "
+    )
+    args: list = []
+    if destination_contains:
+        sql += "WHERE destination ILIKE $1 "
+        args.append(f"%{destination_contains}%")
+    sql += "ORDER BY asked_at DESC LIMIT $%d" % (len(args) + 1)
+    args.append(limit)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *args)
+    out = []
+    for r in rows:
+        party_raw = r["party"]
+        # asyncpg returns jsonb as the parsed Python object
+        out.append({
+            "id": r["id"],
+            "asked_at": r["asked_at"].isoformat(),
+            "destination": r["destination"],
+            "region": r["region"],
+            "depart_date": r["depart_date"].isoformat() if r["depart_date"] else None,
+            "return_date": r["return_date"].isoformat() if r["return_date"] else None,
+            "party": party_raw if isinstance(party_raw, list) else json.loads(party_raw or "[]"),
+            "best": r["best"],
+        })
+    return json.dumps({"ok": True, "count": len(out), "trips": out}, indent=2)
+
+
+@mcp.tool()
+async def travel_plan_trip(
+    destination: str,
+    depart_date: str,
+    return_date: str | None = None,
+    party: list[str] | None = None,
+    depart_time: str = "08:00",
+    max_options: int = 6,
+    origin: str | None = None,
+    origin_label: str | None = None,
+    fly_only: bool = False,
+    dest_airports: list[str] | None = None,
+    overnight_near: str | None = None,
+    prefer_affiliation: str | None = None,
+) -> str:
+    """Plan a trip from Farley Green to a destination — door-to-door, mode-aware.
+
+    Args:
+        destination: Free-text place — town, postcode, or 'lat,lon'.
+                     ('Avignon', 'Saint-Malo', 'Verbier', 'Nice, France'
+                     or '43.95,4.81' all work.)
+        depart_date: ISO date (YYYY-MM-DD).
+        return_date: Optional ISO date (return trip not yet folded into ranking).
+        party: Names of travellers; defaults to is_default=true rows from
+               party_member table (currently 'Stu' + 'Fran').
+        depart_time: Hour to leave home (HH:MM, default 08:00). Drives the
+                     traffic-aware leg estimates from Google Maps.
+        max_options: Cap on returned options (default 6).
+
+    Returns ranked list of door-to-door options across realistic modes
+    (Eurostar, flight, drive+Eurotunnel, fly Geneva+drive for Alps), each
+    with leg-by-leg breakdown, total minutes, transfers, booking URLs, and
+    a confidence tag. Region heuristics drive which modes are tried —
+    Côte d'Azur leads with flight, Brittany leads with Eurotunnel, etc.
+    Persisted to journey_log table for retrospective ('what did we look
+    at last summer?') and ranking-weight tuning.
+    """
+    return json.dumps(
+        await plan_trip_impl(
+            _ctx(), destination, depart_date, return_date, party,
+            depart_time, max_options,
+            origin=origin, origin_label=origin_label,
+            fly_only=fly_only, dest_airports=dest_airports,
+            overnight_near=overnight_near,
+            prefer_affiliation=prefer_affiliation,
+        ),
+        indent=2,
+    )
+
+
+if __name__ == "__main__":
+    from mcp_search.run import serve
+
+    serve(mcp)

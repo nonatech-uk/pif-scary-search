@@ -1,0 +1,14 @@
+FROM localhost/mcp-search:latest
+
+# Phase 3 originally added Playwright + chromium for live price scraping
+# of Eurostar / LeShuttle. Removed 2026-05-03: both operators' SPAs proved
+# hostile to automation, and the brief is about door-to-door comparison
+# (durations) — pricing happens at click-through to the operator.
+#
+# Keeping this Containerfile so the image tag (mcp-search-travel:latest)
+# stays consistent with the quadlet. If/when scrapers come back, restore:
+#   RUN python -m pip install --no-cache-dir playwright \
+#    && playwright install --with-deps chromium
+#
+# (Re-add to travel_mcp.py lifespan + travel_eurostar.py / travel_eurotunnel.py
+#  too — they have signature-compatible `browser` args ready.)
