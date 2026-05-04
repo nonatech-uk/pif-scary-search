@@ -274,6 +274,20 @@ async def check_viaggiatreno(client):
     return f"{len(deps)} live departures"
 
 
+async def check_tfl(client):
+    """TfL journey planner — multi-modal London routing. Tests the
+    disambiguation handler too (St Pancras + Canary Wharf both have
+    multiple matches)."""
+    from mcp_search.travel_tfl import journey
+    j = await journey(client, "St Pancras", "Canary Wharf",
+                      datetime_iso=f"{DATE}T09:00", max_journeys=2)
+    if len(j) < 1:
+        raise AssertionError(f"only {len(j)} journeys")
+    if not j[0].get("legs"):
+        raise AssertionError("first journey has no legs")
+    return f"{len(j)} journeys, {j[0]['duration_minutes']}min cheapest"
+
+
 # --- Registry ---
 
 CHECKS_SCRAPED: list[tuple[str, Callable]] = [
@@ -299,6 +313,7 @@ CHECKS_OFFICIAL: list[tuple[str, Callable]] = [
     ("db-rest-germany",     check_db),
     ("resrobot-sweden",     check_resrobot),
     ("viaggiatreno-italy",  check_viaggiatreno),
+    ("tfl-journey-planner", check_tfl),
 ]
 
 

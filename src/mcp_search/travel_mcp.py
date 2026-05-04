@@ -54,6 +54,12 @@ from mcp_search.travel_austria import AustriaError, search_journey as austria_se
 from mcp_search.travel_norway import NorwayError, search_journey as norway_search
 from mcp_search.travel_sweden import SwedenError, search_journey as sweden_search
 from mcp_search.travel_uber import UberError, price_estimates as uber_prices, time_estimates as uber_times, _deeplink as uber_deeplink
+from mcp_search.travel_tfl import (
+    TflError,
+    journey as tfl_journey,
+    find_stop as tfl_find_stop,
+    line_status as tfl_line_status,
+)
 from mcp_search.travel_geocode import forward_geocode
 from mcp_search.travel_italy_status import ItalyStatusError, departures as italy_departures
 
@@ -1879,6 +1885,87 @@ async def travel_plan_multi_leg(
         ),
         indent=2,
     )
+
+
+@mcp.tool()
+async def travel_tfl_journey(
+    origin: str,
+    destination: str,
+    datetime_iso: str | None = None,
+    is_arrival: bool = False,
+    modes: list[str] | None = None,
+    max_journeys: int = 4,
+) -> str:
+    """Plan a journey via Transport for London's Journey Planner.
+
+    TfL's planner covers all London modes: Tube, Bus, Overground, DLR,
+    Elizabeth Line, Trams, Cable Car, Thames Clippers — plus National
+    Rail trains into London zones. Free public API, no auth.
+
+    Args:
+        origin: Stop name ('Waterloo'), specific TfL StopPoint ID
+                ('940GZZLUKSX'), or 'lat,lon'. Free-text names get
+                disambiguated automatically (prefers transit hubs).
+        destination: Same.
+        datetime_iso: ISO 8601 datetime. None = now.
+        is_arrival: Treat datetime as required arrival time.
+        modes: Filter to ['tube', 'bus', 'walking', 'national-rail',
+               'overground', 'elizabeth-line', 'dlr', 'tram'] etc.
+        max_journeys: Cap on returned options.
+
+    Returns: list of journeys with depart/arrive times, duration_minutes,
+    legs (mode + from/to + minutes + instruction), and Tube fare in
+    pence/GBP where TfL prices it.
+    """
+    try:
+        result = await tfl_journey(
+            _ctx()["client"], origin, destination,
+            datetime_iso=datetime_iso, is_arrival=is_arrival,
+            modes=modes, max_journeys=max_journeys,
+        )
+    except TflError as e:
+        return json.dumps({"ok": False, "mode": "tfl", "error": str(e),
+                           "origin": origin, "destination": destination}, indent=2)
+    return json.dumps({"ok": True, "mode": "tfl",
+                       "origin": origin, "destination": destination,
+                       "journeys": result, "journey_count": len(result)},
+                      indent=2)
+
+
+@mcp.tool()
+async def travel_tfl_find_stop(query: str, max_results: int = 8) -> str:
+    """Search TfL stops by name.
+
+    Returns id / name / modes / lat-lon / zone. Use the `id` directly
+    in travel_tfl_journey to skip ambiguity (e.g. '940GZZLUKSX' for
+    King's Cross St Pancras Tube).
+    """
+    try:
+        result = await tfl_find_stop(_ctx()["client"], query, max_results=max_results)
+    except TflError as e:
+        return json.dumps({"ok": False, "error": str(e), "query": query}, indent=2)
+    return json.dumps({"ok": True, "query": query, "stops": result,
+                       "count": len(result)}, indent=2)
+
+
+@mcp.tool()
+async def travel_tfl_line_status(target: str = "tube") -> str:
+    """Get live TfL line status — Good Service / Minor Delays / Severe
+    Delays / Part Suspended etc., with reason text.
+
+    Args:
+        target: A mode ('tube', 'bus', 'overground', 'dlr', 'tram',
+                'elizabeth-line', 'national-rail', 'river-bus',
+                'cable-car') for ALL lines in that mode, or a specific
+                line id ('victoria', 'central', 'piccadilly', etc.) for
+                just that line.
+    """
+    try:
+        result = await tfl_line_status(_ctx()["client"], target)
+    except TflError as e:
+        return json.dumps({"ok": False, "error": str(e), "target": target}, indent=2)
+    return json.dumps({"ok": True, "target": target, "lines": result,
+                       "count": len(result)}, indent=2)
 
 
 if __name__ == "__main__":
