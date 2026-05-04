@@ -332,7 +332,7 @@ def _fmt_lineup_row(service: dict, kind: str) -> str:
 
 # ---------- tools ----------
 
-@mcp.tool(name="ukrail_find_station")
+@mcp.tool(name="travel_uk_find_station")
 async def uk_find_station(query: str, limit: int = 5) -> str:
     """Search for a UK train station by name. Returns CRS code + name + coords.
 
@@ -354,7 +354,7 @@ async def uk_find_station(query: str, limit: int = 5) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool(name="ukrail_stationboard")
+@mcp.tool(name="travel_uk_stationboard")
 async def uk_stationboard(
     station: str,
     kind: str = "departure",
@@ -456,7 +456,7 @@ async def _tapi_journey(
     return "\n".join(lines).rstrip()
 
 
-@mcp.tool(name="ukrail_journey")
+@mcp.tool(name="travel_uk_journey")
 async def uk_journey(
     origin: str,
     destination: str,
@@ -544,7 +544,7 @@ async def uk_journey(
     return "\n".join(lines).rstrip()
 
 
-@mcp.tool(name="ukrail_service")
+@mcp.tool(name="travel_uk_service")
 async def uk_service(unique_identity: str) -> str:
     """Show the calling pattern (stops) for a specific RTT service.
 
@@ -596,7 +596,7 @@ async def uk_service(unique_identity: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool(name="ukrail_disruptions")
+@mcp.tool(name="travel_uk_disruptions")
 async def uk_disruptions(
     station: str,
     window_minutes: int = 60,

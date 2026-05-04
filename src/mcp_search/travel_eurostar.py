@@ -38,6 +38,23 @@ STATIONS: dict[str, dict[str, Any]] = {
 # tuples so the lookup (which sorts the input pair) hits regardless of
 # direction — ("london","paris") and ("paris","london") both lookup
 # ("london","paris").
+#
+# IMPORTANT — only contains routes that actually run in 2026. Removed
+# 2026-05-04 (corrected by Stu, verified against seat61):
+#   • London ↔ Avignon (suspended 2019, never reinstated)
+#   • London ↔ Marseille (suspended 2019, never reinstated)
+#   • London ↔ Bourg-Saint-Maurice / Moutiers / Aime ski-train
+#       (post-COVID operational status variable year-on-year — don't
+#        assume continuity; treat as "no direct" so plan_trip composes
+#        via Paris+TGV onward when SNCF data lands)
+#   • Ashford International / Ebbsfleet International ↔ Paris
+#       (Eurostar permanently dropped these stops in 2020; trains pass
+#        through but no longer board passengers)
+#
+# When a non-listed pair is queried, eurostar_check correctly returns
+# `direct: false` with the standard "connect via Lille Europe or Paris
+# Gare du Nord; use sncf_journey/db_journey/ns_journey for the onward
+# leg" message. That's the honest answer.
 _DIRECT_RAW: dict[tuple[str, str], dict[str, Any]] = {
     ("london","paris"):       {"minutes": 136, "frequency": "frequent (hourly+)", "seasonal": False},
     ("lille","london"):       {"minutes":  82, "frequency": "frequent",           "seasonal": False},
@@ -45,14 +62,6 @@ _DIRECT_RAW: dict[tuple[str, str], dict[str, Any]] = {
     ("amsterdam","london"):   {"minutes": 232, "frequency": "several daily",      "seasonal": False},
     ("london","rotterdam"):   {"minutes": 206, "frequency": "several daily",      "seasonal": False},
     ("disneyland","london"):  {"minutes": 167, "frequency": "1–2 daily",          "seasonal": False},
-    ("avignon","london"):     {"minutes": 347, "frequency": "weekly",             "seasonal": "summer only (May–Sep)"},
-    ("london","marseille"):   {"minutes": 387, "frequency": "weekly",             "seasonal": "summer only (May–Sep)"},
-    ("bourg-saint-maurice","london"): {"minutes": 467, "frequency": "weekly",     "seasonal": "winter only (Dec–Apr)"},
-    ("london","moutiers"):    {"minutes": 431, "frequency": "weekly",             "seasonal": "winter only (Dec–Apr)"},
-    ("aime","london"):        {"minutes": 442, "frequency": "weekly",             "seasonal": "winter only (Dec–Apr)"},
-    # Cross-Channel inland (rare but Eurostar do run some)
-    ("ashford","paris"):      {"minutes": 116, "frequency": "limited",            "seasonal": "limited"},
-    ("ebbsfleet","paris"):    {"minutes": 124, "frequency": "limited",            "seasonal": "limited"},
 }
 # Normalise keys to alphabetically-sorted tuples at module load (defensive).
 DIRECT_MINUTES: dict[tuple[str, str], dict[str, Any]] = {
@@ -119,6 +128,7 @@ async def check(
         "date": date,
         "adults": adults,
         "source": "static-timetable",
+        "data_sources": ["static-table"],
         "checkin_minutes": ST_PANCRAS_CHECKIN_MIN if o["country"] == "GB" else 30,
         "default_drive_to_st_pancras_min": DEFAULT_DRIVE_TO_ST_PANCRAS,
         "booking_url": _booking_url(o["code"], d["code"], date, adults),

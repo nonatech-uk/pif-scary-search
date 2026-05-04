@@ -92,7 +92,7 @@ def _transportations_list(transportations: list[str] | str | None) -> list[str] 
 # ---------- tools ----------
 
 @mcp.tool
-async def sbb_find_station(
+async def travel_sbb_find_station(
     query: str | None = None,
     lat: float | None = None,
     lon: float | None = None,
@@ -157,7 +157,7 @@ async def sbb_find_station(
 
 
 @mcp.tool
-async def sbb_journey(
+async def travel_sbb_journey(
     origin: str,
     destination: str,
     via: list[str] | str | None = None,
@@ -232,7 +232,7 @@ async def sbb_journey(
 
 
 @mcp.tool
-async def sbb_stationboard(
+async def travel_sbb_stationboard(
     station: str,
     limit: int = 10,
     kind: str = "departure",
@@ -282,7 +282,7 @@ async def sbb_stationboard(
 
 
 @mcp.tool
-async def sbb_disruptions(
+async def travel_sbb_disruptions(
     station: str,
     window_minutes: int = 60,
     kind: str = "departure",

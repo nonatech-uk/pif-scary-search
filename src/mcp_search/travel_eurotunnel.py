@@ -90,6 +90,7 @@ async def check(
         "vehicle": veh,
         "passengers": passengers,
         "source": "static-timetable",
+        "data_sources": ["static-table"],
         "crossing_minutes": CROSSING_MINUTES,
         "terminal_overhead_minutes": TERMINAL_OVERHEAD_MINUTES,
         "terminal_to_terminal_minutes": CROSSING_MINUTES + TERMINAL_OVERHEAD_MINUTES,

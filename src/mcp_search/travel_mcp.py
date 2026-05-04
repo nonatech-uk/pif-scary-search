@@ -37,6 +37,15 @@ from mcp_search.travel_hotels import search as hotels_search
 from mcp_search.travel_multi_leg import plan_multi_leg_impl
 from mcp_search.travel_plan import plan_trip_impl
 from mcp_search.travel_sncf import SncfError, search_journey as sncf_search
+from mcp_search.travel_ns import NSError, search_journey as ns_search
+from mcp_search.travel_sncb import SNCBError, search_journey as sncb_search
+from mcp_search.travel_db import DBError, search_journey as db_search
+from mcp_search.travel_trenitalia import TrenitaliaError, search_journey as trenitalia_search
+from mcp_search.travel_renfe import RenfeError, search_journey as renfe_search
+from mcp_search.travel_austria import AustriaError, search_journey as austria_search
+from mcp_search.travel_norway import NorwayError, search_journey as norway_search
+from mcp_search.travel_sweden import SwedenError, search_journey as sweden_search
+from mcp_search.travel_italy_status import ItalyStatusError, departures as italy_departures
 
 _TTL_FLIGHTS = 6 * 3600
 _TTL_RAIL = 12 * 3600
@@ -335,6 +344,327 @@ async def travel_sncf_journey(
     return json.dumps(
         await _sncf_impl(_ctx(), origin, destination, datetime_iso, max_journeys), indent=2
     )
+
+
+@mcp.tool()
+async def travel_ns_journey(
+    origin: str,
+    destination: str,
+    datetime_iso: str,
+    is_arrival: bool = False,
+    max_journeys: int = 5,
+) -> str:
+    """Plan a Dutch rail journey via NS Reisinformatie API (NL).
+
+    Free-text origin/destination resolves against NS station list (cached
+    after first call). Accepts station codes ('ASD','RTD','UT'), exact
+    names ('Amsterdam Centraal','Utrecht Centraal'), or substrings.
+
+    Args:
+        origin: Free-text Dutch station name or code.
+        destination: Same.
+        datetime_iso: ISO datetime with timezone offset
+            ('2026-06-15T09:00:00+02:00') or naive ISO.
+        is_arrival: If True, datetime_iso is the arrive-by target.
+        max_journeys: Cap on returned options.
+
+    Each journey carries planned + actual durations, transfers, crowd
+    forecast, and per-leg details (operator, train number, platforms).
+    """
+    try:
+        result = await ns_search(
+            _ctx()["client"], origin, destination, datetime_iso,
+            is_arrival=is_arrival, max_journeys=max_journeys,
+        )
+    except NSError as e:
+        return json.dumps({"ok": False, "mode": "rail", "country": "NL",
+                           "error": str(e), "origin": origin,
+                           "destination": destination, "datetime": datetime_iso}, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def travel_sncb_journey(
+    origin: str,
+    destination: str,
+    datetime_iso: str,
+    max_journeys: int = 6,
+) -> str:
+    """Plan a Belgian rail journey via the iRail community API (BE).
+
+    Free-text origin/destination resolves against the iRail station list.
+    iRail uses English-dash names ('Brussels-South','Antwerp-Central',
+    'Liège-Guillemins') but accepts substrings of either standard or
+    local names.
+
+    Args:
+        origin: Free-text Belgian station name.
+        destination: Same.
+        datetime_iso: ISO datetime; date+time used (timezone ignored —
+            iRail assumes Belgium local).
+        max_journeys: Cap on returned options.
+
+    No auth needed. Live data from SNCB / NMBS scraped by iRail.
+    """
+    try:
+        result = await sncb_search(
+            _ctx()["client"], origin, destination, datetime_iso,
+            max_journeys=max_journeys,
+        )
+    except SNCBError as e:
+        return json.dumps({"ok": False, "mode": "rail", "country": "BE",
+                           "error": str(e), "origin": origin,
+                           "destination": destination, "datetime": datetime_iso}, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def travel_db_journey(
+    origin: str,
+    destination: str,
+    datetime_iso: str | None = None,
+    max_journeys: int = 4,
+) -> str:
+    """Plan a German rail journey via db-rest (community DB HAFAS wrapper).
+
+    Free-text origin/destination resolves via db-rest /locations endpoint
+    (handles 'Köln Hbf', 'München Hauptbahnhof', 'Frankfurt(Main)Hbf'
+    transparently — preferring 'stop' type results).
+
+    Args:
+        origin: Free-text German (or cross-border) station name.
+        destination: Same.
+        datetime_iso: ISO datetime with timezone offset preferred.
+            If None, planner uses 'now'.
+        max_journeys: Cap on returned options.
+
+    No auth. db-rest (v6.db.transport.rest) is a community service;
+    occasionally has downtime. We fail-soft. To self-host, set
+    DB_REST_BASE env var to your own instance.
+    """
+    try:
+        result = await db_search(
+            _ctx()["client"], origin, destination, datetime_iso,
+            max_journeys=max_journeys,
+        )
+    except DBError as e:
+        return json.dumps({"ok": False, "mode": "rail", "country": "DE",
+                           "error": str(e), "origin": origin,
+                           "destination": destination, "datetime": datetime_iso}, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def travel_italy_journey(
+    origin: str,
+    destination: str,
+    date: str,
+    adults: int = 2,
+) -> str:
+    """Italian high-speed rail (curated city-pair durations + booking deeplinks).
+
+    Trenitalia (Frecciarossa) and Italo (NTV) have no public journey-
+    planning API; their booking sites need SPA session auth that's not
+    cleanly scrapeable. This tool returns curated direct-route durations
+    for major Italian HSR pairs (Milano/Roma/Napoli/Firenze/Venezia/
+    Torino/Bologna/etc.) plus deeplinks for booking on
+    lefrecce.it (Trenitalia) and italotreno.com (Italo).
+
+    Args:
+        origin: Italian city — 'milano', 'roma', 'firenze' (case-
+                insensitive substring on station name accepted too).
+        destination: Same.
+        date: ISO date YYYY-MM-DD.
+        adults: Headcount (default 2).
+
+    For unknown city pairs returns ok=true direct=false with the booking
+    URLs — user can plan via Trenitalia or Italo's site directly.
+    """
+    try:
+        result = await trenitalia_search(_ctx()["client"], origin, destination, date, adults=adults)
+    except TrenitaliaError as e:
+        return json.dumps({"ok": False, "mode": "rail", "country": "IT",
+                           "error": str(e), "origin": origin,
+                           "destination": destination, "date": date}, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def travel_spain_journey(
+    origin: str,
+    destination: str,
+    date: str,
+    adults: int = 2,
+) -> str:
+    """Spanish high-speed rail (curated city-pair durations + booking deeplinks).
+
+    Renfe (AVE/AVLO), Iryo, and Ouigo Spain have no public journey-
+    planning API. Renfe's data.renfe.com publishes static GTFS but
+    not in a journey-planner shape. This tool returns curated direct-
+    route durations for the major AVE corridors (Madrid-Barcelona,
+    Madrid-Sevilla/Málaga/Valencia/Alicante/Zaragoza, plus the
+    Mediterranean and cross-border to France) with all three operators'
+    booking deeplinks.
+
+    Args:
+        origin: Spanish city — 'madrid', 'barcelona', 'sevilla', etc.
+                (case-insensitive substring on station name accepted).
+        destination: Same.
+        date: ISO date YYYY-MM-DD.
+        adults: Headcount (default 2).
+
+    For unknown city pairs returns ok=true direct=false with all three
+    booking URLs — Spain's three-operator HSR market means you'll
+    typically check renfe.com / iryo.eu / ouigo.com to compare.
+    """
+    try:
+        result = await renfe_search(_ctx()["client"], origin, destination, date, adults=adults)
+    except RenfeError as e:
+        return json.dumps({"ok": False, "mode": "rail", "country": "ES",
+                           "error": str(e), "origin": origin,
+                           "destination": destination, "date": date}, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def travel_austria_journey(
+    origin: str,
+    destination: str,
+    date: str,
+    adults: int = 2,
+) -> str:
+    """Austrian rail (curated city-pair durations + ÖBB booking deeplink).
+
+    Covers ÖBB Railjet (Wien-Salzburg-Innsbruck-Bregenz, Wien-Graz),
+    Eurocity cross-border (Innsbruck-Italy, Salzburg-München, Wien-Praha
+    /Budapest/Bratislava), and Nightjet sleepers (Wien overnight to
+    Roma/Milano/Hamburg/Amsterdam/Brussels/Paris).
+
+    Static-timetable data — no live availability or pricing. Use the
+    booking_url for actual prices on shop.oebbtickets.at.
+    """
+    try:
+        result = await austria_search(_ctx()["client"], origin, destination, date, adults=adults)
+    except AustriaError as e:
+        return json.dumps({"ok": False, "mode": "rail", "country": "AT",
+                           "error": str(e), "origin": origin,
+                           "destination": destination, "date": date}, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def travel_norway_journey(
+    origin: str,
+    destination: str,
+    datetime_iso: str,
+    max_journeys: int = 5,
+) -> str:
+    """Norwegian rail journey planner via Entur (NO).
+
+    Entur is Norway's national journey-planner data hub — fully public
+    GraphQL API, no auth, gold-standard documentation. Covers Vy and
+    other Norwegian operators. Free-text origin/destination resolved via
+    Entur's geocoder.
+
+    Args:
+        origin: Free-text Norwegian station ('Oslo S', 'Bergen', 'Trondheim').
+        destination: Same.
+        datetime_iso: ISO datetime ('2026-06-15T08:00:00').
+        max_journeys: Cap on returned options (default 5).
+
+    Live timetable + line/operator info per leg. The best European rail
+    API we have access to — wish all countries did it like this.
+
+    **Note on fjord car-ferries**: Most Norwegian car ferries are
+    turn-up-and-go (queue, drive on, pay onboard or via licence-plate
+    camera billing) — no reservation. This tool returns schedule + live
+    status, which is what you actually need to plan around them. The
+    GraphQL query includes water transport so ferry legs surface
+    naturally in mixed rail+ferry trips (Bergen→Stavanger via Mortavika
+    crossing, Bodø→Moskenes Lofoten, etc.).
+    """
+    try:
+        result = await norway_search(
+            _ctx()["client"], origin, destination, datetime_iso,
+            max_journeys=max_journeys,
+        )
+    except NorwayError as e:
+        return json.dumps({"ok": False, "mode": "rail", "country": "NO",
+                           "error": str(e), "origin": origin,
+                           "destination": destination, "datetime": datetime_iso}, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def travel_sweden_journey(
+    origin: str,
+    destination: str,
+    datetime_iso: str,
+    max_journeys: int = 5,
+) -> str:
+    """Swedish national journey planner via Trafiklab ResRobot v2.1 (SE).
+
+    Pan-Sweden multi-modal — SJ national rail, regional operators, bus,
+    tram, ferry, Stockholm Tunnelbana. HAFAS-based; ResRobot is the
+    consolidated successor to the older Reseplanerare / Stolptidstabeller
+    APIs. Free-text origin/destination resolved via location.name first.
+
+    Args:
+        origin: Free-text Swedish station ('Stockholm Centralstation',
+                'Göteborg', 'Malmö C', 'Kiruna').
+        destination: Same.
+        datetime_iso: ISO datetime ('2026-06-15T08:00:00').
+        max_journeys: Cap on returned options.
+
+    Live HAFAS data — includes train number (e.g. Snabbtåg 429),
+    operator, per-leg from/to + tracks. Snabbtåg = SJ's high-speed
+    service.
+    """
+    try:
+        result = await sweden_search(
+            _ctx()["client"], origin, destination, datetime_iso,
+            max_journeys=max_journeys,
+        )
+    except SwedenError as e:
+        return json.dumps({"ok": False, "mode": "rail", "country": "SE",
+                           "error": str(e), "origin": origin,
+                           "destination": destination, "datetime": datetime_iso}, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def travel_italy_status(
+    station: str,
+    datetime_iso: str | None = None,
+    max_results: int = 20,
+) -> str:
+    """Italian rail live departures via ViaggiaTreno (Trenitalia infomobilità).
+
+    Live train status from Trenitalia's still-public infomobilità REST
+    endpoints. Useful for "what's leaving Roma Termini in the next hour"
+    and "is FR9523 to Milano running on time" — the kind of last-minute
+    check that static tables can't answer.
+
+    Args:
+        station: Free-text station name; ViaggiaTreno autocomplete
+            resolves it to a station ID (e.g. 'Roma Termini' → S08409).
+        datetime_iso: ISO datetime; defaults to 'now'.
+        max_results: Cap on returned trains (default 20).
+
+    Each train carries: number, category (FR/IC/RV/etc.), destination,
+    track, scheduled time, **delay in minutes**, departed/in-station
+    flags. Italy's regional/branch-line trains DO appear here, unlike
+    in travel_italy_journey which is HSR-only.
+    """
+    try:
+        result = await italy_departures(
+            _ctx()["client"], station, datetime_iso=datetime_iso, max_results=max_results,
+        )
+    except ItalyStatusError as e:
+        return json.dumps({"ok": False, "country": "IT",
+                           "error": str(e), "station": station,
+                           "datetime": datetime_iso}, indent=2)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
