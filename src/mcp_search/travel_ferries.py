@@ -186,7 +186,7 @@ def find_route(origin_port: str, dest_port: str) -> list[dict[str, Any]]:
 
 
 async def check(
-    browser,             # signature kept compatible w/ other static modules; unused
+    client,             # httpx.AsyncClient | None — live data fetched when present
     origin_port: str,
     dest_port: str,
     date: str,
@@ -204,14 +204,54 @@ async def check(
     except ValueError as e:
         raise FerryError(f"invalid date {date!r}: {e}") from e
 
+    # Local import to avoid a cycle if travel_dfds ever needs travel_ferries.
+    from mcp_search.travel_dfds import (
+        get_sailings as dfds_sailings, is_known_route as dfds_known, DFDSError,
+    )
+
+    data_sources: set[str] = {"static-table"}
+
     options = []
     for r in matches:
         url = _booking_url(r["operator"], r["origin_port"], r["dest_port"], date, vehicle, passengers)
-        options.append({
+        opt = {
             **r,
             "terminal_to_terminal_minutes": r["crossing_minutes"] + r["terminal_overhead_minutes"],
             "booking_url": url,
-        })
+            "live_data": False,
+            "data_sources": ["static-table"],
+        }
+
+        # DFDS routes get enriched with live sailings + prices.
+        if (
+            client is not None
+            and "dfds" in r["operator"].lower()
+            and dfds_known(r["origin_port"], r["dest_port"])
+        ):
+            try:
+                sailings = await dfds_sailings(
+                    client,
+                    date=date,
+                    origin=r["origin_port"],
+                    destination=r["dest_port"],
+                    adults=passengers,
+                    vehicle=vehicle,
+                )
+                available = [
+                    s["best_price"] for s in sailings
+                    if s.get("best_price") is not None
+                ]
+                opt["live_data"] = True
+                opt["sailings"] = sailings
+                opt["sailing_count"] = len(sailings)
+                opt["best_price"] = min(available) if available else None
+                opt["currency"] = sailings[0]["currency"] if sailings else None
+                opt["data_sources"] = ["dfds-live"]
+                data_sources.add("dfds-live")
+            except DFDSError as e:
+                opt["live_error"] = str(e)
+
+        options.append(opt)
 
     # Sort by total time
     options.sort(key=lambda o: o["terminal_to_terminal_minutes"])
@@ -225,11 +265,13 @@ async def check(
         "date": date,
         "vehicle": vehicle,
         "passengers": passengers,
-        "source": "static-timetable",
+        "source": ("dfds-live+static" if "dfds-live" in data_sources else "static-timetable"),
+        "data_sources": sorted(data_sources),
         "options": options,
         "note": (
-            "Time-only data; ferry operators don't expose public price APIs. "
-            "Click each option's booking_url for live availability and pricing."
+            "DFDS sailings carry live prices + per-sailing availability; "
+            "other operators are static (no public price API). Click "
+            "each option's booking_url for live data on non-DFDS lines."
         ),
         "as_of": datetime.utcnow().isoformat() + "Z",
     }

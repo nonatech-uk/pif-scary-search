@@ -1753,11 +1753,17 @@ async def travel_ferry_check(
 ) -> str:
     """Find ferry crossings between two named ports on a date.
 
-    Static-timetable data — operators don't expose public booking APIs.
+    DFDS rows carry LIVE data — every sailing for the day with real
+    prices and per-sailing availability (Channel: Dover↔Calais,
+    Dover↔Dunkirk, Newhaven↔Dieppe; Channel Islands; North Sea cabin:
+    Newcastle↔Amsterdam, Rosslare↔Dunkirk; Baltic). Other operators
+    return static crossing-time + frequency data only — no public price
+    APIs exist; users click booking_url for live operator pricing.
+
     Returns one entry per operator/route combo (e.g. Dover→Calais comes
-    back as DFDS, P&O Ferries, and Irish Ferries — three rows). Includes
-    crossing minutes, terminal overhead, total terminal-to-terminal time,
-    operator-side booking URL.
+    back as DFDS [live], P&O [static], and Irish Ferries [static] — three
+    rows). DFDS rows additionally include `sailings[]` with the day's
+    timetable, prices, and a `best_price`.
 
     Args:
         origin_port: Substring of port name — 'Dover', 'Portsmouth',
@@ -1765,13 +1771,14 @@ async def travel_ferry_check(
         dest_port: Substring of destination port. 'Calais', 'Dublin',
                    'Belfast', 'Caen', etc.
         date: ISO date (YYYY-MM-DD).
-        vehicle: 'car' (default), 'high-vehicle', 'caravan-trailer',
-                 'motorcycle', or 'foot-passenger'.
+        vehicle: 'car' (default), 'motorcycle', or 'foot' (DFDS live);
+                 'high-vehicle' / 'caravan-trailer' / 'foot-passenger'
+                 accepted but treated as 'car' for DFDS price lookup.
         passengers: Headcount (default 2).
     """
     try:
         result = await ferry_check(
-            None, origin_port=origin_port, dest_port=dest_port,
+            _ctx()["client"], origin_port=origin_port, dest_port=dest_port,
             date=date, vehicle=vehicle, passengers=passengers,
         )
     except FerryError as e:
