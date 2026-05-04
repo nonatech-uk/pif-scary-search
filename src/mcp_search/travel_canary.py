@@ -162,10 +162,13 @@ async def check_duffel(client):
 
 async def check_drive_time(client):
     from mcp_search.travel_drive import drive_time
-    r = await drive_time(client, "LGW airport", "Farley Green, UK")
+    # Probe with the same future date the rail/ferry tests use, so we
+    # exercise predictive-traffic routing (not just live current).
+    r = await drive_time(client, "LGW airport", "Farley Green, UK",
+                         depart_at=f"{DATE}T09:00:00Z")
     if not r.get("duration_minutes") or r["duration_minutes"] <= 0:
         raise AssertionError(f"invalid duration: {r.get('duration_minutes')}")
-    return f"{r['duration_minutes']} min, {r.get('distance_km')} km"
+    return f"{r['duration_minutes']:.1f} min, {r.get('distance_km')} km"
 
 
 async def check_norway(client):
