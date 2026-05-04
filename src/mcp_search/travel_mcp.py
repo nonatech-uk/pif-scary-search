@@ -14,7 +14,7 @@ see /root/.claude/plans/brief-mcp-travel-steady-fountain.md.
 import asyncio
 import json
 import os
-from datetime import date as date_type
+from datetime import date as date_type, datetime
 from typing import Any
 
 import asyncpg
@@ -27,7 +27,11 @@ from mcp_search.travel_affiliations import VALID_TAGS, filter_by as affiliations
 from mcp_search.travel_cache import cache_get, cache_set
 from mcp_search.travel_drive import DriveError, drive_time as drive_route
 from mcp_search.travel_duffel import DuffelError, search_offers
-from mcp_search.travel_eurostar import EurostarError, check as eurostar_scrape
+from mcp_search.travel_eurostar import (
+    EurostarError,
+    check as eurostar_scrape,
+    build_booking_url as eurostar_build_url,
+)
 from mcp_search.travel_eurotunnel import EurotunnelError, check as eurotunnel_scrape
 from mcp_search.travel_ferries import (
     FerryError, check as ferry_check, routes_to as ferry_routes_to,
@@ -844,6 +848,125 @@ async def travel_eurostar_check(
         await _eurostar_impl(_ctx(), origin_city, dest_city, date, adults, time=time),
         indent=2,
     )
+
+
+@mcp.tool()
+async def travel_eurostar_prices_via_safari(
+    origin_city: str,
+    dest_city: str,
+    date: str,
+    adults: int = 2,
+    return_date: str | None = None,
+) -> str:
+    """Build a Eurostar booking URL + workflow for fetching live prices
+    through the user's desktop Safari (apple_browser_* MCP tools).
+
+    Eurostar's GraphQL `JourneySearch` endpoint exposes seat availability
+    but NOT prices — fares live behind the React booking SPA, which is
+    actively hostile to headless scraping. The reliable workaround is to
+    open the booking URL in the user's actual Safari (already
+    authenticated, real fingerprint) and read prices off the rendered
+    page via `apple_browser_get_page_text`.
+
+    This tool returns:
+      - `booking_url`: the precise Eurostar URL (origin/dest/date/adults)
+      - `journeys`: live timetable + per-class seat counts (from the
+        same JourneySearch endpoint travel_eurostar_check uses) —
+        useful for matching prices in the page text back to specific
+        train times
+      - `workflow`: ordered apple_browser_* tool calls the calling LLM
+        should chain to fetch + read prices
+      - `parsing_hints`: text patterns to look for when extracting prices
+
+    Args:
+        origin_city: 'london' or another known slug.
+        dest_city: target station slug.
+        date: YYYY-MM-DD outbound date.
+        adults: Pax count (affects displayed totals).
+        return_date: Optional YYYY-MM-DD for return-trip pricing.
+
+    Workflow the calling LLM should run after this tool:
+      1. mcp__claude_ai_Mees_Only__apple_browser_open_url(url=<booking_url>)
+      2. wait ~6 seconds for the React SPA to render the timetable
+      3. mcp__claude_ai_Mees_Only__apple_browser_get_page_text()
+      4. parse train rows: lines pairing 'HH:MM → HH:MM' with '£NN'
+    """
+    try:
+        url_info = eurostar_build_url(
+            origin_city=origin_city,
+            dest_city=dest_city,
+            date=date,
+            adults=adults,
+            return_date=return_date,
+        )
+    except EurostarError as e:
+        return json.dumps({"ok": False, "mode": "eurostar", "error": str(e)}, indent=2)
+
+    # Reuse the live JourneySearch result so the LLM has the timetable
+    # to correlate against the page text.
+    timetable = await _eurostar_impl(
+        _ctx(), origin_city, dest_city, date, adults, time="10:00",
+    )
+
+    workflow = [
+        {
+            "step": 1,
+            "tool": "mcp__claude_ai_Mees_Only__apple_browser_open_url",
+            "args": {"url": url_info["url"]},
+            "purpose": "Open the Eurostar booking page in the user's desktop Safari",
+        },
+        {
+            "step": 2,
+            "tool": None,
+            "wait_seconds": 6,
+            "purpose": "Let the React SPA render the timetable + prices",
+        },
+        {
+            "step": 3,
+            "tool": "mcp__claude_ai_Mees_Only__apple_browser_get_page_text",
+            "args": {},
+            "purpose": "Extract visible page text — includes per-train prices",
+        },
+        {
+            "step": 4,
+            "tool": None,
+            "purpose": (
+                "Parse prices from text: each train row pairs a "
+                "'HH:MM → HH:MM' time with a '£NN' price; correlate "
+                "with `journeys` from this response to attach prices "
+                "to specific trains."
+            ),
+        },
+    ]
+
+    parsing_hints = {
+        "price_pattern": r"£\s?\d+(?:\.\d{2})?",
+        "time_pattern": r"\d{2}:\d{2}\s*[→\-–]\s*\d{2}:\d{2}",
+        "fare_classes": ["Standard", "Standard Premier", "Business Premier"],
+        "note": (
+            "Eurostar's React app shows the cheapest fare per train as "
+            "'From £XX'; per-class prices appear after clicking a train. "
+            "For round-trips, prices may show as outbound+return total."
+        ),
+    }
+
+    return json.dumps({
+        "ok": True,
+        "mode": "eurostar",
+        "service": "eurostar-safari-pricecheck",
+        "from": url_info["from"], "from_code": url_info["from_code"],
+        "to": url_info["to"], "to_code": url_info["to_code"],
+        "date": date,
+        "return_date": return_date,
+        "adults": adults,
+        "booking_url": url_info["url"],
+        "journeys": timetable.get("journeys") if isinstance(timetable, dict) else None,
+        "journey_count": timetable.get("journey_count") if isinstance(timetable, dict) else None,
+        "workflow": workflow,
+        "parsing_hints": parsing_hints,
+        "data_sources": ["eurostar-live", "manual-via-safari"],
+        "as_of": datetime.utcnow().isoformat() + "Z",
+    }, indent=2)
 
 
 @mcp.tool()

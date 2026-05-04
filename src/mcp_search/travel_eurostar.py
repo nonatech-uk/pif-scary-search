@@ -130,17 +130,53 @@ def _resolve_station(query: str) -> dict[str, Any]:
     )
 
 
-def _booking_url(o_code: str, d_code: str, date: str, adults: int) -> str:
-    qs = urlencode(
-        {
-            "travelMode": "oneway",
-            "trainOriginStation": o_code,
-            "trainDestinationStation": d_code,
-            "outbound": date,
-            "adults": adults,
-        }
-    )
+def _booking_url(
+    o_code: str,
+    d_code: str,
+    date: str,
+    adults: int,
+    return_date: str | None = None,
+) -> str:
+    params: dict[str, Any] = {
+        "trainOriginStation": o_code,
+        "trainDestinationStation": d_code,
+        "outbound": date,
+        "adults": adults,
+    }
+    if return_date:
+        params["travelMode"] = "return"
+        params["inbound"] = return_date
+    else:
+        params["travelMode"] = "oneway"
+    qs = urlencode(params)
     return f"https://www.eurostar.com/uk-en/book?{qs}"
+
+
+def build_booking_url(
+    origin_city: str,
+    dest_city: str,
+    date: str,
+    adults: int = 2,
+    return_date: str | None = None,
+) -> dict[str, Any]:
+    """Public helper: resolve city slugs and return the booking URL plus
+    station metadata. Used by the Safari-pricecheck workflow tool."""
+    o = _resolve_station(origin_city)
+    d = _resolve_station(dest_city)
+    try:
+        date_type.fromisoformat(date)
+    except ValueError as e:
+        raise EurostarError(f"invalid date {date!r}: {e}") from e
+    if return_date:
+        try:
+            date_type.fromisoformat(return_date)
+        except ValueError as e:
+            raise EurostarError(f"invalid return_date {return_date!r}: {e}") from e
+    return {
+        "url": _booking_url(o["code"], d["code"], date, adults, return_date),
+        "from": o["name"], "from_code": o["code"],
+        "to": d["name"], "to_code": d["code"],
+    }
 
 
 async def _fetch_journeys(
