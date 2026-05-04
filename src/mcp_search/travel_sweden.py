@@ -121,6 +121,7 @@ async def search_journey(
     origin: str,
     destination: str,
     datetime_iso: str,
+    is_arrival: bool = False,
     max_journeys: int = 5,
 ) -> dict[str, Any]:
     o = await resolve_station(client, origin)
@@ -136,17 +137,21 @@ async def search_journey(
         date_part = datetime_iso
         time_part = "08:00"
 
+    params = {
+        "originId": o["id"],
+        "destId": d["id"],
+        "date": date_part,
+        "time": time_part,
+        "format": "json",
+        "numF": max_journeys,
+        "accessId": _api_key(),
+    }
+    if is_arrival:
+        params["searchForArrival"] = 1
+
     resp = await client.get(
         f"{RESROBOT_BASE}/trip",
-        params={
-            "originId": o["id"],
-            "destId": d["id"],
-            "date": date_part,
-            "time": time_part,
-            "format": "json",
-            "numF": max_journeys,
-            "accessId": _api_key(),
-        },
+        params=params,
         timeout=30.0,
     )
     if resp.status_code >= 400:

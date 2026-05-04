@@ -57,11 +57,12 @@ async def resolve_stop(client: httpx.AsyncClient, query: str) -> dict[str, Any] 
 
 
 _TRIP_QUERY = """
-query Trip($from: Location!, $to: Location!, $dt: DateTime!, $n: Int!) {
+query Trip($from: Location!, $to: Location!, $dt: DateTime!, $n: Int!, $arriveBy: Boolean!) {
   trip(
     from: $from
     to: $to
     dateTime: $dt
+    arriveBy: $arriveBy
     numTripPatterns: $n
     modes: { transportModes: [
       { transportMode: rail },
@@ -121,6 +122,7 @@ async def search_journey(
     origin: str,
     destination: str,
     datetime_iso: str,
+    is_arrival: bool = False,
     max_journeys: int = 5,
 ) -> dict[str, Any]:
     o = await resolve_stop(client, origin)
@@ -134,6 +136,7 @@ async def search_journey(
             "from": {"place": o["id"]},
             "to": {"place": d["id"]},
             "dt": datetime_iso,
+            "arriveBy": is_arrival,
             "n": max_journeys,
         },
     }

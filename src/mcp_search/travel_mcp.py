@@ -147,12 +147,14 @@ async def _flight_impl(
 
 
 async def _sncf_impl(
-    ctx: dict, origin: str, destination: str, datetime_iso: str, max_journeys: int
+    ctx: dict, origin: str, destination: str, datetime_iso: str,
+    is_arrival: bool, max_journeys: int,
 ) -> dict[str, Any]:
     args = {
         "origin": origin,
         "destination": destination,
         "datetime": datetime_iso,
+        "is_arrival": is_arrival,
         "max_journeys": max_journeys,
     }
     bucket = date_type.fromisoformat(datetime_iso.split("T", 1)[0])
@@ -164,7 +166,8 @@ async def _sncf_impl(
 
     try:
         result = await sncf_search(
-            ctx["client"], origin, destination, datetime_iso, max_journeys=max_journeys
+            ctx["client"], origin, destination, datetime_iso,
+            is_arrival=is_arrival, max_journeys=max_journeys,
         )
     except SncfError as e:
         return {
@@ -333,6 +336,7 @@ async def travel_sncf_journey(
     origin: str,
     destination: str,
     datetime_iso: str,
+    is_arrival: bool = False,
     max_journeys: int = 5,
 ) -> str:
     """Plan a French rail journey via the SNCF Navitia API.
@@ -342,7 +346,8 @@ async def travel_sncf_journey(
     in the SNCF API — `booking_deeplink` jumps to sncf-connect.com.
     """
     return json.dumps(
-        await _sncf_impl(_ctx(), origin, destination, datetime_iso, max_journeys), indent=2
+        await _sncf_impl(_ctx(), origin, destination, datetime_iso, is_arrival, max_journeys),
+        indent=2,
     )
 
 
@@ -388,7 +393,8 @@ async def travel_sncb_journey(
     origin: str,
     destination: str,
     datetime_iso: str,
-    max_journeys: int = 6,
+    is_arrival: bool = False,
+    max_journeys: int = 5,
 ) -> str:
     """Plan a Belgian rail journey via the iRail community API (BE).
 
@@ -402,6 +408,8 @@ async def travel_sncb_journey(
         destination: Same.
         datetime_iso: ISO datetime; date+time used (timezone ignored —
             iRail assumes Belgium local).
+        is_arrival: If True, datetime_iso is the arrive-by target
+            (iRail timeSel=arrival).
         max_journeys: Cap on returned options.
 
     No auth needed. Live data from SNCB / NMBS scraped by iRail.
@@ -409,7 +417,7 @@ async def travel_sncb_journey(
     try:
         result = await sncb_search(
             _ctx()["client"], origin, destination, datetime_iso,
-            max_journeys=max_journeys,
+            is_arrival=is_arrival, max_journeys=max_journeys,
         )
     except SNCBError as e:
         return json.dumps({"ok": False, "mode": "rail", "country": "BE",
@@ -422,8 +430,9 @@ async def travel_sncb_journey(
 async def travel_db_journey(
     origin: str,
     destination: str,
-    datetime_iso: str | None = None,
-    max_journeys: int = 4,
+    datetime_iso: str,
+    is_arrival: bool = False,
+    max_journeys: int = 5,
 ) -> str:
     """Plan a German rail journey via db-rest (community DB HAFAS wrapper).
 
@@ -435,7 +444,8 @@ async def travel_db_journey(
         origin: Free-text German (or cross-border) station name.
         destination: Same.
         datetime_iso: ISO datetime with timezone offset preferred.
-            If None, planner uses 'now'.
+        is_arrival: If True, datetime_iso is the arrive-by target
+            (db-rest `arrival` param).
         max_journeys: Cap on returned options.
 
     No auth. db-rest (v6.db.transport.rest) is a community service;
@@ -445,7 +455,7 @@ async def travel_db_journey(
     try:
         result = await db_search(
             _ctx()["client"], origin, destination, datetime_iso,
-            max_journeys=max_journeys,
+            is_arrival=is_arrival, max_journeys=max_journeys,
         )
     except DBError as e:
         return json.dumps({"ok": False, "mode": "rail", "country": "DE",
@@ -557,6 +567,7 @@ async def travel_norway_journey(
     origin: str,
     destination: str,
     datetime_iso: str,
+    is_arrival: bool = False,
     max_journeys: int = 5,
 ) -> str:
     """Norwegian rail journey planner via Entur (NO).
@@ -570,6 +581,8 @@ async def travel_norway_journey(
         origin: Free-text Norwegian station ('Oslo S', 'Bergen', 'Trondheim').
         destination: Same.
         datetime_iso: ISO datetime ('2026-06-15T08:00:00').
+        is_arrival: If True, datetime_iso is the arrive-by target
+            (Entur GraphQL `arriveBy: true`).
         max_journeys: Cap on returned options (default 5).
 
     Live timetable + line/operator info per leg. The best European rail
@@ -586,7 +599,7 @@ async def travel_norway_journey(
     try:
         result = await norway_search(
             _ctx()["client"], origin, destination, datetime_iso,
-            max_journeys=max_journeys,
+            is_arrival=is_arrival, max_journeys=max_journeys,
         )
     except NorwayError as e:
         return json.dumps({"ok": False, "mode": "rail", "country": "NO",
@@ -600,6 +613,7 @@ async def travel_sweden_journey(
     origin: str,
     destination: str,
     datetime_iso: str,
+    is_arrival: bool = False,
     max_journeys: int = 5,
 ) -> str:
     """Swedish national journey planner via Trafiklab ResRobot v2.1 (SE).
@@ -614,6 +628,8 @@ async def travel_sweden_journey(
                 'Göteborg', 'Malmö C', 'Kiruna').
         destination: Same.
         datetime_iso: ISO datetime ('2026-06-15T08:00:00').
+        is_arrival: If True, datetime_iso is the arrive-by target
+            (ResRobot `searchForArrival=1`).
         max_journeys: Cap on returned options.
 
     Live HAFAS data — includes train number (e.g. Snabbtåg 429),
@@ -623,7 +639,7 @@ async def travel_sweden_journey(
     try:
         result = await sweden_search(
             _ctx()["client"], origin, destination, datetime_iso,
-            max_journeys=max_journeys,
+            is_arrival=is_arrival, max_journeys=max_journeys,
         )
     except SwedenError as e:
         return json.dumps({"ok": False, "mode": "rail", "country": "SE",
@@ -810,6 +826,7 @@ async def travel_compare_modes(
             origin=sncf["origin"],
             destination=sncf["destination"],
             datetime_iso=sncf["datetime_iso"],
+            is_arrival=sncf.get("is_arrival", False),
             max_journeys=sncf.get("max_journeys", 5),
         )
 

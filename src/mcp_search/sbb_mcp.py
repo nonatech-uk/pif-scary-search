@@ -168,7 +168,23 @@ async def travel_sbb_journey(
     direct: bool = False,
     limit: int = 4,
 ) -> str:
-    """Plan a journey between two Swiss stations.
+    """Plan a journey via the Swiss SBB / transport.opendata.ch planner.
+
+    **Scope** — this is a Switzerland-adjacent planner, not pan-European.
+    What works:
+      - Anywhere ↔ anywhere via Switzerland (e.g. Lyon ↔ Wien via Zürich)
+      - Paris ↔ Italy via Lyria / Gotthard / Simplon (Paris→Milano live)
+      - Milano ↔ Germany via Zürich
+      - Pure Switzerland-internal (Zürich ↔ Bern ↔ Genève)
+    What doesn't:
+      - Italy-internal (Milano ↔ Roma)             → use travel_italy_journey
+      - DB-internal or ÖBB-internal                → use travel_db / travel_austria_journey
+      - Pure DE↔AT routes (Brussels ↔ Berlin)      → use travel_db_journey
+      - Cross-Channel (London ↔ anywhere)          → use travel_eurostar_check
+      - Italian station names ⚠ silently mis-route — SBB's resolver picks
+        a plausible-looking Swiss/border station and the trip data is
+        wrong without erroring. Always cross-check with travel_italy_*
+        for Italy-internal sections.
 
     `origin` and `destination` can be station names ("Zurich HB") or IDs.
     Optional: `via` (1-5 intermediate stops), `date` (YYYY-MM-DD), `time`

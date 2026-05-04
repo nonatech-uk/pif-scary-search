@@ -140,6 +140,7 @@ async def search_journey(
     origin: str,
     destination: str,
     datetime_iso: str,
+    is_arrival: bool = False,
     max_journeys: int = 5,
 ) -> dict[str, Any]:
     o = await resolve_place(client, origin)
@@ -155,6 +156,7 @@ async def search_journey(
             "from": o["id"],
             "to": d["id"],
             "datetime": _fmt_dt(datetime_iso),
+            "datetime_represents": "arrival" if is_arrival else "departure",
             "count": max_journeys,
         },
         auth=_auth(),

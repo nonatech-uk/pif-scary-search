@@ -89,24 +89,27 @@ async def search_journey(
     client: httpx.AsyncClient,
     origin: str,
     destination: str,
-    datetime_iso: str | None = None,
-    max_journeys: int = 4,
+    datetime_iso: str,
+    is_arrival: bool = False,
+    max_journeys: int = 5,
 ) -> dict[str, Any]:
     o = await resolve_station(client, origin)
     d = await resolve_station(client, destination)
     if not o or not d:
         raise DBError(f"could not resolve origin={origin!r} or destination={destination!r}")
 
+    # db-rest expects ISO 8601 with timezone; assume UTC if naive
+    dt = datetime_iso if ("+" in datetime_iso or "Z" in datetime_iso) else datetime_iso + "Z"
+
     params: dict[str, Any] = {
         "from": o["id"],
         "to": d["id"],
         "results": max_journeys,
     }
-    if datetime_iso:
-        # db-rest expects ISO 8601 with timezone; assume UTC if naive
-        if "+" not in datetime_iso and "Z" not in datetime_iso:
-            datetime_iso = datetime_iso + "Z"
-        params["departure"] = datetime_iso
+    if is_arrival:
+        params["arrival"] = dt
+    else:
+        params["departure"] = dt
 
     resp = await client.get(
         f"{_base()}/journeys",

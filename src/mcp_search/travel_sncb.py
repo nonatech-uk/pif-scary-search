@@ -131,7 +131,8 @@ async def search_journey(
     origin: str,
     destination: str,
     datetime_iso: str,
-    max_journeys: int = 6,
+    is_arrival: bool = False,
+    max_journeys: int = 5,
 ) -> dict[str, Any]:
     o = await resolve_station(client, origin)
     d = await resolve_station(client, destination)
@@ -147,6 +148,7 @@ async def search_journey(
         "to": d,
         "date": _format_date(date_part),
         "time": _format_time(time_part),
+        "timeSel": "arrival" if is_arrival else "depart",
         "format": "json",
     }
     resp = await client.get(
