@@ -204,9 +204,12 @@ async def check(
     except ValueError as e:
         raise FerryError(f"invalid date {date!r}: {e}") from e
 
-    # Local import to avoid a cycle if travel_dfds ever needs travel_ferries.
+    # Local imports to avoid cycles if these modules ever need travel_ferries.
     from mcp_search.travel_dfds import (
         get_sailings as dfds_sailings, is_known_route as dfds_known, DFDSError,
+    )
+    from mcp_search.travel_brittany_ferries import (
+        get_sailings as bf_sailings, is_known_route as bf_known, BrittanyFerriesError,
     )
 
     data_sources: set[str] = {"static-table"}
@@ -222,10 +225,12 @@ async def check(
             "data_sources": ["static-table"],
         }
 
+        op_lower = r["operator"].lower()
+
         # DFDS routes get enriched with live sailings + prices.
         if (
             client is not None
-            and "dfds" in r["operator"].lower()
+            and "dfds" in op_lower
             and dfds_known(r["origin_port"], r["dest_port"])
         ):
             try:
@@ -251,6 +256,41 @@ async def check(
             except DFDSError as e:
                 opt["live_error"] = str(e)
 
+        # Brittany Ferries routes — same pattern, prices + per-tier breakdown.
+        elif (
+            client is not None
+            and "brittany" in op_lower
+            and bf_known(r["origin_port"], r["dest_port"])
+        ):
+            try:
+                bf_vehicle = "car" if vehicle in ("car", "high-vehicle", "caravan-trailer") else (
+                    "motorbike" if vehicle == "motorcycle" else
+                    "bicycle"   if vehicle == "bicycle" else
+                    "none"
+                )
+                bf_data = await bf_sailings(
+                    client,
+                    date=date,
+                    origin=r["origin_port"],
+                    destination=r["dest_port"],
+                    adults=passengers,
+                    vehicle=bf_vehicle,
+                )
+                sailings = bf_data["sailings"]
+                available = [
+                    s["best_price"] for s in sailings
+                    if s.get("best_price") is not None
+                ]
+                opt["live_data"] = True
+                opt["sailings"] = sailings
+                opt["sailing_count"] = len(sailings)
+                opt["best_price"] = min(available) if available else None
+                opt["currency"] = bf_data.get("currency", "GBP")
+                opt["data_sources"] = ["brittany-ferries-live"]
+                data_sources.add("brittany-ferries-live")
+            except BrittanyFerriesError as e:
+                opt["live_error"] = str(e)
+
         options.append(opt)
 
     # Sort by total time
@@ -265,13 +305,18 @@ async def check(
         "date": date,
         "vehicle": vehicle,
         "passengers": passengers,
-        "source": ("dfds-live+static" if "dfds-live" in data_sources else "static-timetable"),
+        "source": (
+            "live+static"
+            if any(s.endswith("-live") for s in data_sources)
+            else "static-timetable"
+        ),
         "data_sources": sorted(data_sources),
         "options": options,
         "note": (
-            "DFDS sailings carry live prices + per-sailing availability; "
-            "other operators are static (no public price API). Click "
-            "each option's booking_url for live data on non-DFDS lines."
+            "DFDS and Brittany Ferries sailings carry live prices + per-"
+            "sailing availability. Other operators (P&O, Stena, Irish "
+            "Ferries, Steam Packet) remain static — click their booking_url "
+            "for live data."
         ),
         "as_of": datetime.utcnow().isoformat() + "Z",
     }

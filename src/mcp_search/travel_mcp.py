@@ -1753,17 +1753,23 @@ async def travel_ferry_check(
 ) -> str:
     """Find ferry crossings between two named ports on a date.
 
-    DFDS rows carry LIVE data — every sailing for the day with real
-    prices and per-sailing availability (Channel: Dover↔Calais,
-    Dover↔Dunkirk, Newhaven↔Dieppe; Channel Islands; North Sea cabin:
-    Newcastle↔Amsterdam, Rosslare↔Dunkirk; Baltic). Other operators
-    return static crossing-time + frequency data only — no public price
-    APIs exist; users click booking_url for live operator pricing.
+    DFDS and Brittany Ferries rows carry LIVE data — every sailing for
+    the day with real prices and per-sailing availability:
+      - DFDS: Channel (Dover↔Calais/Dunkirk, Newhaven↔Dieppe), Channel
+        Islands, Newcastle↔Amsterdam cabin, Rosslare↔Dunkirk, Baltic.
+      - Brittany Ferries: Plymouth↔Roscoff, Portsmouth↔StMalo/Caen/
+        LeHavre/Cherbourg, Poole↔Cherbourg, Portsmouth↔Bilbao/Santander,
+        Cork↔Roscoff, Rosslare↔Bilbao. Per-tier (economy/standard/flexi)
+        prices when available.
+
+    Other operators (P&O, Stena, Irish Ferries, Steam Packet) return
+    static crossing-time + frequency data only — their booking sites
+    don't expose public APIs; click their booking_url for live data.
 
     Returns one entry per operator/route combo (e.g. Dover→Calais comes
     back as DFDS [live], P&O [static], and Irish Ferries [static] — three
-    rows). DFDS rows additionally include `sailings[]` with the day's
-    timetable, prices, and a `best_price`.
+    rows). Live rows additionally include `sailings[]` with the day's
+    timetable, per-sailing prices, and a `best_price`.
 
     Args:
         origin_port: Substring of port name — 'Dover', 'Portsmouth',
