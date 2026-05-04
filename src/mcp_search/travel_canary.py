@@ -179,6 +179,20 @@ async def check_po_hull_rotterdam(client):
     return f"{len(s)} sailings"
 
 
+async def check_trenitalia(client):
+    """Trenitalia BFF — CSRF-token + gzipped JSON. The most fragile of
+    the scraped endpoints (multi-step auth, fully obfuscated SPA), so
+    most valuable to canary weekly."""
+    from mcp_search.travel_trenitalia_live import get_solutions
+    s = await get_solutions(client, DATE, "milano", "roma", adults=1, limit=3)
+    if len(s) < 1:
+        raise AssertionError(f"only {len(s)} solutions")
+    priced = [x for x in s if x.get("best_price") is not None]
+    if not priced:
+        raise AssertionError("no priced solutions (CSRF may have broken)")
+    return f"{len(s)} solutions, cheapest €{min(p['best_price'] for p in priced)}"
+
+
 # --- Official-API checks ---
 
 async def check_duffel(client):
@@ -273,6 +287,7 @@ CHECKS_SCRAPED: list[tuple[str, Callable]] = [
     ("po-dover-calais",        check_po_dover_calais),
     ("po-larne-cairnryan",     check_po_larne_cairnryan),
     ("po-hull-rotterdam",      check_po_hull_rotterdam),
+    ("trenitalia-bff",         check_trenitalia),
 ]
 
 CHECKS_OFFICIAL: list[tuple[str, Callable]] = [
