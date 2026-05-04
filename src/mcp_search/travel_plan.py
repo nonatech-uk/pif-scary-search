@@ -360,6 +360,118 @@ def _parse_iso_duration_min(s: str) -> int:
     return total
 
 
+async def build_north_sea_ferry(
+    ctx, dest: dict, depart_dt: datetime,
+    origin: str = ORIGIN_HOME_DEFAULT, origin_label: str = ORIGIN_HOME_LABEL_DEFAULT,
+) -> dict[str, Any]:
+    """Drive to a UK east-coast port → overnight North Sea ferry → drive to destination.
+
+    Three viable car-passenger crossings to NL/BE for onward Continental
+    drive. We let drive_time pick the best UK port for the origin
+    (Hull/Newcastle/Harwich), and pick the right Continental port based
+    on the destination country (NL → Rotterdam/Hook, DE/CH/AT/CZ →
+    Zeebrugge or Rotterdam).
+
+    For Northern UK origins (Yorkshire, NE, Scotland) this often
+    dominates Folkestone+Eurotunnel on door-to-door time.
+    """
+    # UK port candidates with their crossings
+    UK_PORTS = [
+        ("Hull, UK",       "Hull",      "Rotterdam Europoort, NL", "Rotterdam",  660, "P&O Ferries", "NL"),
+        ("Hull, UK",       "Hull",      "Zeebrugge, BE",            "Zeebrugge",  780, "P&O Ferries", "BE"),
+        ("Newcastle, UK",  "Newcastle", "IJmuiden, NL",             "IJmuiden",   900, "DFDS",        "NL"),
+        ("Harwich, UK",    "Harwich",   "Hook of Holland, NL",      "Hook of Holland", 420, "Stena Line", "NL"),
+    ]
+    dest_country = (dest.get("country_code") or "").lower()
+    # Score each crossing by drive-home-to-port + crossing — pick the fastest
+    async def _score(port_geo, uk_name, dest_geo, dest_name, crossing_min, op, dest_cc):
+        d = await _drive_or_fallback(
+            ctx["client"], origin, port_geo,
+            _to_iso_z(depart_dt), fallback_min=180,
+        )
+        return {
+            "uk_port_geo": port_geo, "uk_port": uk_name,
+            "dest_port_geo": dest_geo, "dest_port": dest_name,
+            "crossing_min": crossing_min, "operator": op,
+            "dest_cc": dest_cc,
+            "drive_home_min": int(round(d["duration_minutes"])),
+            "drive_home_km": d.get("distance_km"),
+            "drive_home_fallback": d.get("fallback", False),
+        }
+    scored = await asyncio.gather(*[_score(*p) for p in UK_PORTS])
+    # Filter by destination country compatibility (NL or BE land port)
+    # — NL/BE → either; further-east countries (DE/CH/AT/CZ) → either also,
+    # then drive on. So all four are candidates regardless of dest.
+    scored.sort(key=lambda x: x["drive_home_min"] + x["crossing_min"])
+    pick = scored[0]
+
+    # Drive at destination — Continental port → final destination
+    arrive_continent = depart_dt + timedelta(
+        minutes=pick["drive_home_min"] + 60 + pick["crossing_min"] + 30,
+    )
+    drive_dest = await _drive_or_fallback(
+        ctx["client"], pick["dest_port_geo"], f"{dest['lat']},{dest['lon']}",
+        _to_iso_z(arrive_continent), fallback_min=240,
+    )
+    drive_min_dest = int(round(drive_dest["duration_minutes"]))
+
+    door_to_door = (
+        pick["drive_home_min"] + 60 + pick["crossing_min"] + 30 + drive_min_dest
+    )
+    legs = [
+        {
+            "kind": "drive", "from": origin_label, "to": pick["uk_port"],
+            "minutes": pick["drive_home_min"], "operator": "self-drive",
+            "note": f"{pick['drive_home_km']} km"
+                    + (" (live traffic)" if not pick["drive_home_fallback"] else " (static estimate)"),
+        },
+        {
+            "kind": "wait", "from": pick["uk_port"], "to": pick["uk_port"],
+            "minutes": 60, "note": "60-min pre-departure (vehicle check-in, customs)",
+        },
+        {
+            "kind": "ferry", "from": pick["uk_port"], "to": pick["dest_port"],
+            "minutes": pick["crossing_min"], "operator": pick["operator"],
+            "note": f"Overnight crossing (~{pick['crossing_min']//60}h{pick['crossing_min']%60:02d}m)",
+        },
+        {
+            "kind": "wait", "from": pick["dest_port"], "to": pick["dest_port"],
+            "minutes": 30, "note": "Vehicle disembarkation + customs",
+        },
+        {
+            "kind": "drive", "from": pick["dest_port"], "to": dest["display_name"],
+            "minutes": drive_min_dest, "operator": "self-drive",
+            "note": f"{drive_dest.get('distance_km','?')} km Continental drive"
+                    + (" (live traffic)" if not drive_dest.get("fallback") else " (static estimate)"),
+        },
+    ]
+    return {
+        "ok": True,
+        "mode": "north_sea_ferry",
+        "door_to_door_minutes": door_to_door,
+        "transfers": 1,
+        "legs": legs,
+        "data_sources": [
+            "static-table",
+            "google-maps" if not pick["drive_home_fallback"] else "static-fallback",
+            "google-maps" if not drive_dest.get("fallback") else "static-fallback",
+        ],
+        "booking_urls": [],   # operator-specific URLs would be added per pick
+        "trade_offs": [
+            f"Overnight North Sea crossing — sleeper cabin, your car arrives with you.",
+            f"Best for Northern-UK origins — picked {pick['uk_port']} over Folkestone "
+            f"({pick['drive_home_min']} min drive home → port).",
+            f"Saves a full day's continental drive vs Folkestone+Eurotunnel for "
+            f"NL/DE/CH/AT destinations.",
+        ],
+        "summary": (
+            f"{pick['uk_port']} → {pick['dest_port']} ({pick['operator']}): "
+            f"{door_to_door} min door-to-door "
+            f"({pick['drive_home_min']}+60+{pick['crossing_min']}+30+{drive_min_dest})"
+        ),
+    }
+
+
 async def build_multiday_drive(
     ctx, dest: dict, depart_dt: datetime, overnight_near: str,
     origin: str = ORIGIN_HOME_DEFAULT, origin_label: str = ORIGIN_HOME_LABEL_DEFAULT,
@@ -512,12 +624,17 @@ async def plan_trip_impl(
                                        origin=origin, origin_label=origin_label,
                                        prefer_carriers=prefer_carriers,
                                        exclude_carriers=exclude_carriers)))
+        elif m == "north_sea_ferry":
+            tasks.append(("north_sea_ferry",
+                          build_north_sea_ferry(ctx, geo, depart_dt,
+                                                origin=origin, origin_label=origin_label)))
 
     # Optional multi-day-drive option triggered by overnight_near
     if overnight_near and not fly_only:
         tasks.append(("multiday-drive",
                       build_multiday_drive(ctx, geo, depart_dt, overnight_near,
                                            origin=origin, origin_label=origin_label)))
+        modes = list(modes) + ["multiday-drive"]   # reflect actually-considered set
 
     raw = await asyncio.gather(*[t for _, t in tasks], return_exceptions=True)
     options = []

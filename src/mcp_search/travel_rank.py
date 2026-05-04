@@ -141,11 +141,11 @@ REGION_MODES: dict[str, list[str]] = {
     "brittany":               ["eurotunnel", "flight"],
     "normandy":               ["eurotunnel", "flight"],
     "rhone-alps":             ["flight", "eurostar"],
-    "alps-ski":               ["fly_geneva_drive", "eurostar"],
-    "switzerland":            ["flight", "eurostar"],
-    "belgium-netherlands":    ["eurostar", "flight"],
+    "alps-ski":               ["fly_geneva_drive", "eurostar", "north_sea_ferry"],
+    "switzerland":            ["flight", "eurostar", "north_sea_ferry"],
+    "belgium-netherlands":    ["eurostar", "flight", "north_sea_ferry"],
     "generic-fr":             ["eurotunnel", "flight", "eurostar"],
-    "generic-eu":             ["flight"],
+    "generic-eu":             ["flight", "north_sea_ferry"],
     "uk":                     [],
 }
 

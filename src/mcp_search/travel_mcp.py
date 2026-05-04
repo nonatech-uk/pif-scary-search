@@ -756,46 +756,73 @@ async def travel_drive_time(
 
 @mcp.tool()
 async def travel_compare_modes(
-    date: str,
+    origin: str | None = None,
+    destination: str | None = None,
+    datetime_iso: str | None = None,
     flight: dict | None = None,
     eurostar: dict | None = None,
     eurotunnel: dict | None = None,
     sncf: dict | None = None,
+    ns: dict | None = None,
+    sncb: dict | None = None,
+    db: dict | None = None,
+    norway: dict | None = None,
+    sweden: dict | None = None,
+    italy: dict | None = None,
+    spain: dict | None = None,
+    austria: dict | None = None,
 ) -> str:
     """Run multiple modes in parallel and return a side-by-side comparison.
 
-    Pass per-mode argument dicts; each runs concurrently with fail-soft.
-    A single dead mode does not kill the others. Per-tool caching applies
-    transparently so repeat calls are cheap.
+    The top-level `origin`, `destination`, `datetime_iso` are a
+    **universal core** — any rail mode whose dict doesn't override them
+    inherits them. Per-mode dicts can:
+      - Pass `{}` to engage the mode with full inheritance from the core
+      - Override any field (e.g. `{'origin':'Paris Gare de Lyon'}` to
+        change just the origin for SNCF, leaving destination + datetime
+        inherited)
+      - Add mode-specific extras (cabin, prefer_carriers, vehicle, etc.)
 
     Args:
-        date: ISO date for the trip (YYYY-MM-DD). Some modes need a more
-              specific datetime (sncf) — pass it inside that mode's dict.
-        flight: e.g. {"origin_iata": "LGW", "dest_iata": "NCE",
-                      "cabin": "economy", "adults": 2}
-        eurostar: e.g. {"origin_city": "london", "dest_city": "paris",
-                        "adults": 2}
-        eurotunnel: e.g. {"time": "10:00", "vehicle": "car",
-                          "passengers": 2}
-        sncf: e.g. {"origin": "Paris Gare de Lyon",
-                    "destination": "Avignon TGV",
-                    "datetime_iso": "2026-06-15T09:00",
-                    "max_journeys": 5}
+        origin: Universal origin (free text — used by rail modes that
+            don't override).
+        destination: Universal destination (same).
+        datetime_iso: Universal ISO datetime — rail modes use this; static
+            tables and eurotunnel derive a date from it.
+        flight: {"origin_iata":"LGW","dest_iata":"NCE","cabin":"economy",
+                 "adults":2,"prefer_carriers":["BA"]}
+                — flight needs IATA codes so it doesn't share the rail
+                free-text core.
+        eurostar: {"origin_city":"london","dest_city":"paris","adults":2}
+        eurotunnel: {"time":"10:00","vehicle":"car","passengers":2}
+        sncf / ns / sncb / db / norway / sweden:
+            {} (full inherit) or {"origin":..., "destination":...,
+             "datetime_iso":..., "is_arrival":false, "max_journeys":5}
+        italy / spain / austria:
+            {} or {"origin":..., "destination":..., "adults":2}
+            — static HSR tables, derive `date` from datetime_iso/date.
 
     Returns:
-        JSON dict {date, requested: [...], results: {mode: <result_dict>}}
-        where each result_dict is the same shape as the equivalent
-        single-mode tool, including ok/error fields on failure.
+        JSON dict {origin, destination, datetime_iso, requested: [...],
+        results: {mode: <result_dict>}}. Each mode's failure is reported
+        in its own row; one dead mode never kills the others.
     """
     ctx = _ctx()
     tasks: dict[str, Any] = {}
+
+    # Derive a date from datetime_iso if needed for static-table modes
+    derived_date = datetime_iso.split("T", 1)[0] if datetime_iso else None
+
+    def _pull(d: dict, key: str, fallback):
+        """Mode-dict override or universal fallback."""
+        return d.get(key, fallback)
 
     if flight is not None:
         tasks["flight"] = _flight_impl(
             ctx,
             origin_iata=flight["origin_iata"],
             dest_iata=flight["dest_iata"],
-            date=flight.get("date", date),
+            date=_pull(flight, "date", derived_date),
             cabin=flight.get("cabin", "economy"),
             adults=flight.get("adults", 2),
             prefer_carriers=flight.get("prefer_carriers"),
@@ -805,16 +832,16 @@ async def travel_compare_modes(
     if eurostar is not None:
         tasks["eurostar"] = _eurostar_impl(
             ctx,
-            origin_city=eurostar["origin_city"],
-            dest_city=eurostar["dest_city"],
-            date=eurostar.get("date", date),
+            origin_city=_pull(eurostar, "origin_city", origin or "london"),
+            dest_city=_pull(eurostar, "dest_city", destination),
+            date=_pull(eurostar, "date", derived_date),
             adults=eurostar.get("adults", 2),
         )
 
     if eurotunnel is not None:
         tasks["eurotunnel"] = _eurotunnel_impl(
             ctx,
-            date=eurotunnel.get("date", date),
+            date=_pull(eurotunnel, "date", derived_date),
             time=eurotunnel.get("time", "10:00"),
             vehicle=eurotunnel.get("vehicle", "car"),
             passengers=eurotunnel.get("passengers", 2),
@@ -823,16 +850,94 @@ async def travel_compare_modes(
     if sncf is not None:
         tasks["sncf"] = _sncf_impl(
             ctx,
-            origin=sncf["origin"],
-            destination=sncf["destination"],
-            datetime_iso=sncf["datetime_iso"],
+            origin=_pull(sncf, "origin", origin),
+            destination=_pull(sncf, "destination", destination),
+            datetime_iso=_pull(sncf, "datetime_iso", datetime_iso),
             is_arrival=sncf.get("is_arrival", False),
             max_journeys=sncf.get("max_journeys", 5),
         )
 
+    if ns is not None:
+        tasks["ns"] = ns_search(
+            ctx["client"],
+            _pull(ns, "origin", origin),
+            _pull(ns, "destination", destination),
+            _pull(ns, "datetime_iso", datetime_iso),
+            is_arrival=ns.get("is_arrival", False),
+            max_journeys=ns.get("max_journeys", 5),
+        )
+
+    if sncb is not None:
+        tasks["sncb"] = sncb_search(
+            ctx["client"],
+            _pull(sncb, "origin", origin),
+            _pull(sncb, "destination", destination),
+            _pull(sncb, "datetime_iso", datetime_iso),
+            is_arrival=sncb.get("is_arrival", False),
+            max_journeys=sncb.get("max_journeys", 5),
+        )
+
+    if db is not None:
+        tasks["db"] = db_search(
+            ctx["client"],
+            _pull(db, "origin", origin),
+            _pull(db, "destination", destination),
+            _pull(db, "datetime_iso", datetime_iso),
+            is_arrival=db.get("is_arrival", False),
+            max_journeys=db.get("max_journeys", 5),
+        )
+
+    if norway is not None:
+        tasks["norway"] = norway_search(
+            ctx["client"],
+            _pull(norway, "origin", origin),
+            _pull(norway, "destination", destination),
+            _pull(norway, "datetime_iso", datetime_iso),
+            is_arrival=norway.get("is_arrival", False),
+            max_journeys=norway.get("max_journeys", 5),
+        )
+
+    if sweden is not None:
+        tasks["sweden"] = sweden_search(
+            ctx["client"],
+            _pull(sweden, "origin", origin),
+            _pull(sweden, "destination", destination),
+            _pull(sweden, "datetime_iso", datetime_iso),
+            is_arrival=sweden.get("is_arrival", False),
+            max_journeys=sweden.get("max_journeys", 5),
+        )
+
+    if italy is not None:
+        tasks["italy"] = trenitalia_search(
+            ctx["client"],
+            _pull(italy, "origin", origin),
+            _pull(italy, "destination", destination),
+            _pull(italy, "date", derived_date),
+            adults=italy.get("adults", 2),
+        )
+
+    if spain is not None:
+        tasks["spain"] = renfe_search(
+            ctx["client"],
+            _pull(spain, "origin", origin),
+            _pull(spain, "destination", destination),
+            _pull(spain, "date", derived_date),
+            adults=spain.get("adults", 2),
+        )
+
+    if austria is not None:
+        tasks["austria"] = austria_search(
+            ctx["client"],
+            _pull(austria, "origin", origin),
+            _pull(austria, "destination", destination),
+            _pull(austria, "date", derived_date),
+            adults=austria.get("adults", 2),
+        )
+
     if not tasks:
         return json.dumps(
-            {"ok": False, "error": "no modes requested; pass at least one of flight/eurostar/eurotunnel/sncf"},
+            {"ok": False, "error": "no modes requested; pass at least one of "
+             "flight/eurostar/eurotunnel/sncf/ns/sncb/db/norway/sweden/italy/spain/austria"},
             indent=2,
         )
 
@@ -850,7 +955,14 @@ async def travel_compare_modes(
             results[k] = r
 
     return json.dumps(
-        {"date": date, "requested": keys, "results": results},
+        {
+            "origin": origin,
+            "destination": destination,
+            "datetime_iso": datetime_iso,
+            "date": derived_date,
+            "requested": keys,
+            "results": results,
+        },
         indent=2,
     )
 
