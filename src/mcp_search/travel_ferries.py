@@ -224,6 +224,9 @@ async def check(
     from mcp_search.travel_stena_line import (
         get_sailings as stena_sailings, is_known_route as stena_known, StenaLineError,
     )
+    from mcp_search.travel_po_ferries import (
+        get_sailings as po_sailings, is_known_route as po_known, POFerriesError,
+    )
 
     data_sources: set[str] = {"static-table"}
 
@@ -302,6 +305,40 @@ async def check(
                 opt["data_sources"] = ["brittany-ferries-live"]
                 data_sources.add("brittany-ferries-live")
             except BrittanyFerriesError as e:
+                opt["live_error"] = str(e)
+
+        # P&O Ferries — Expian B2C REST. Channel + Larne-Cairnryan + Hull-Rotterdam.
+        elif (
+            client is not None
+            and ("p&o" in op_lower or "p and o" in op_lower)
+            and po_known(r["origin_port"], r["dest_port"])
+        ):
+            try:
+                po_vehicle = (
+                    "car" if vehicle in ("car", "high-vehicle", "caravan-trailer") else
+                    "motorhome" if vehicle == "motorhome" else
+                    "motorcycle" if vehicle == "motorcycle" else
+                    "van" if vehicle == "van" else
+                    "bicycle" if vehicle == "bicycle" else
+                    "none"
+                )
+                sailings = await po_sailings(
+                    client, date=date,
+                    origin=r["origin_port"], destination=r["dest_port"],
+                    adults=passengers, vehicle=po_vehicle,
+                )
+                available = [
+                    s["best_price"] for s in sailings
+                    if s.get("best_price") is not None
+                ]
+                opt["live_data"] = True
+                opt["sailings"] = sailings
+                opt["sailing_count"] = len(sailings)
+                opt["best_price"] = min(available) if available else None
+                opt["currency"] = sailings[0]["currency"] if sailings else "GBP"
+                opt["data_sources"] = ["po-ferries-live"]
+                data_sources.add("po-ferries-live")
+            except POFerriesError as e:
                 opt["live_error"] = str(e)
 
         # Stena Line routes — GraphQL, multi-currency, full passenger/vehicle matrix.

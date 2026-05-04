@@ -1753,21 +1753,23 @@ async def travel_ferry_check(
 ) -> str:
     """Find ferry crossings between two named ports on a date.
 
-    DFDS, Brittany Ferries, and Stena Line rows carry LIVE data — every
-    sailing for the day with real prices and per-sailing availability:
+    DFDS, Brittany Ferries, Stena Line, and P&O Ferries rows carry LIVE
+    data — every sailing for the day with real prices and availability:
       - DFDS: Channel (Dover↔Calais/Dunkirk, Newhaven↔Dieppe), Channel
         Islands, Newcastle↔Amsterdam cabin, Rosslare↔Dunkirk, Baltic.
       - Brittany Ferries: Plymouth↔Roscoff, Portsmouth↔StMalo/Caen/
         LeHavre/Cherbourg, Poole↔Cherbourg, Portsmouth↔Bilbao/Santander,
         Cork↔Roscoff, Rosslare↔Bilbao. Per-tier (economy/standard/flexi).
-      - Stena Line (GraphQL, cleanest of the three): Holyhead↔Dublin,
-        Belfast↔Cairnryan/Liverpool, Fishguard↔Rosslare, Harwich↔Hook
-        of Holland, plus 7 Scandinavian routes (Kiel↔Gothenburg etc).
-        Multi-currency (GBP/EUR/SEK/DKK/NOK).
+      - Stena Line (GraphQL): Holyhead↔Dublin, Belfast↔Cairnryan/Liverpool,
+        Fishguard↔Rosslare, Harwich↔Hook of Holland, plus 7 Scandinavian
+        routes. Multi-currency (GBP/EUR/SEK/DKK/NOK).
+      - P&O Ferries (Expian REST): Dover↔Calais (Channel — competes with
+        DFDS), Larne↔Cairnryan, Hull↔Rotterdam (sole operator). 3-tier
+        fares (Standard / Flexi / Fully Flexi).
 
-    Other operators (P&O, Irish Ferries, Steam Packet) return static
-    crossing-time + frequency data only — their booking sites don't
-    expose public APIs; click their booking_url for live data.
+    Other operators (Irish Ferries, Steam Packet) return static crossing-
+    time + frequency data only — their booking sites don't expose public
+    APIs; click their booking_url for live data.
 
     Returns one entry per operator/route combo (e.g. Dover→Calais comes
     back as DFDS [live], P&O [static], and Irish Ferries [static] — three

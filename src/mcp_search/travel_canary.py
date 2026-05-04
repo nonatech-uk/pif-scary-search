@@ -149,6 +149,36 @@ async def check_stena_line(client):
     return f"{len(s)} sailings, cheapest £{min(avail)}"
 
 
+async def check_po_dover_calais(client):
+    from mcp_search.travel_po_ferries import get_sailings
+    s = await get_sailings(client, DATE, "dover", "calais", adults=2, vehicle="car")
+    if len(s) < 5:
+        raise AssertionError(f"only {len(s)} sailings (expected ≥5 — many daily Dover-Calais)")
+    avail = [x["best_price"] for x in s if x.get("best_price") is not None]
+    if not avail:
+        raise AssertionError("no priced sailings")
+    return f"{len(s)} sailings, cheapest £{min(avail)}"
+
+
+async def check_po_larne_cairnryan(client):
+    from mcp_search.travel_po_ferries import get_sailings
+    s = await get_sailings(client, DATE, "larne", "cairnryan", adults=2, vehicle="none")
+    if len(s) < 1:
+        raise AssertionError(f"only {len(s)} sailings")
+    avail = [x["best_price"] for x in s if x.get("best_price") is not None]
+    if not avail:
+        raise AssertionError("no priced sailings")
+    return f"{len(s)} sailings, cheapest £{min(avail)}"
+
+
+async def check_po_hull_rotterdam(client):
+    from mcp_search.travel_po_ferries import get_sailings
+    s = await get_sailings(client, DATE, "hull", "rotterdam", adults=2, vehicle="car")
+    if len(s) < 1:
+        raise AssertionError(f"only {len(s)} sailings")
+    return f"{len(s)} sailings"
+
+
 # --- Official-API checks ---
 
 async def check_duffel(client):
@@ -233,13 +263,16 @@ async def check_viaggiatreno(client):
 # --- Registry ---
 
 CHECKS_SCRAPED: list[tuple[str, Callable]] = [
-    ("eurostar-graphql",    check_eurostar),
-    ("leshuttle-quote",     check_eurotunnel),
-    ("dfds-hellman",        check_dfds_hellman),
-    ("dfds-fares-flow",     check_dfds_fares_flow),
-    ("dfds-cabin-fares",    check_dfds_cabin_fares),
-    ("brittany-ferries",    check_brittany_ferries),
-    ("stena-line-graphql",  check_stena_line),
+    ("eurostar-graphql",       check_eurostar),
+    ("leshuttle-quote",        check_eurotunnel),
+    ("dfds-hellman",           check_dfds_hellman),
+    ("dfds-fares-flow",        check_dfds_fares_flow),
+    ("dfds-cabin-fares",       check_dfds_cabin_fares),
+    ("brittany-ferries",       check_brittany_ferries),
+    ("stena-line-graphql",     check_stena_line),
+    ("po-dover-calais",        check_po_dover_calais),
+    ("po-larne-cairnryan",     check_po_larne_cairnryan),
+    ("po-hull-rotterdam",      check_po_hull_rotterdam),
 ]
 
 CHECKS_OFFICIAL: list[tuple[str, Callable]] = [

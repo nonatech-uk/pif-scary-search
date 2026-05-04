@@ -557,12 +557,14 @@ async def build_irish_sea_ferry(
     scored.sort(key=lambda x: x["estimated_total_min"])
     pick = scored[0]
 
-    # Live prices: Stena GraphQL for Holyhead-Dublin / Cairnryan-Belfast / Fishguard-Rosslare
+    # Live prices: Stena GraphQL or P&O Expian REST. Falls through to
+    # static if neither operator handles this route.
     live: dict[str, Any] | None = None
-    if "stena" in pick["operator"].lower():
+    op_lower = pick["operator"].lower()
+    if "stena" in op_lower:
         try:
             from mcp_search.travel_stena_line import (
-                get_sailings as stena_sailings, is_known_route as stena_known, StenaLineError,
+                get_sailings as stena_sailings, is_known_route as stena_known,
             )
             if stena_known(pick["uk_port"], pick["ie_port"]):
                 sailings = await stena_sailings(
@@ -575,6 +577,28 @@ async def build_irish_sea_ferry(
                     "sailings": sailings,
                     "best_price": min(avail) if avail else None,
                     "currency": sailings[0]["currency"] if sailings else "GBP",
+                    "source": "stena-line-live",
+                }
+        except (Exception,):
+            live = None
+    elif "p&o" in op_lower or "p and o" in op_lower:
+        try:
+            from mcp_search.travel_po_ferries import (
+                get_sailings as po_sailings, is_known_route as po_known,
+            )
+            # P&O does Larne-Cairnryan (NOT Cairnryan-Belfast); Liverpool-Dublin (NOT in our P&O routes)
+            if po_known(pick["uk_port"], pick["ie_port"]):
+                sailings = await po_sailings(
+                    ctx["client"], date=depart_dt.strftime("%Y-%m-%d"),
+                    origin=pick["uk_port"], destination=pick["ie_port"],
+                    adults=2, vehicle="car",
+                )
+                avail = [s["best_price"] for s in sailings if s.get("best_price") is not None]
+                live = {
+                    "sailings": sailings,
+                    "best_price": min(avail) if avail else None,
+                    "currency": sailings[0]["currency"] if sailings else "GBP",
+                    "source": "po-ferries-live",
                 }
         except (Exception,):
             live = None
@@ -644,7 +668,7 @@ async def build_irish_sea_ferry(
             else None
         ),
         "data_sources": [
-            "stena-line-live" if live else "static-table",
+            (live or {}).get("source", "static-table") if live else "static-table",
             "google-maps" if not pick["drive_home_fallback"] else "static-fallback",
             "google-maps" if not drive_dest.get("fallback") else "static-fallback",
         ],
@@ -756,7 +780,6 @@ async def build_north_sea_ferry(
             from mcp_search.travel_stena_line import (
                 get_sailings as stena_sailings, is_known_route as stena_known, StenaLineError,
             )
-            # Stena's Harwich-Hook of Holland: pick['uk_port']='Harwich', pick['dest_port']='Hook of Holland'
             if stena_known(pick["uk_port"], pick["dest_port"]):
                 sailings = await stena_sailings(
                     ctx["client"], date=depart_dt.strftime("%Y-%m-%d"),
@@ -770,6 +793,27 @@ async def build_north_sea_ferry(
                     "currency": sailings[0]["currency"] if sailings else "GBP",
                 }
         except (StenaLineError, Exception):
+            live = None
+
+    elif "p&o" in op_lower or "p and o" in op_lower:
+        try:
+            from mcp_search.travel_po_ferries import (
+                get_sailings as po_sailings, is_known_route as po_known,
+            )
+            # P&O Hull-Rotterdam — only operator on this route
+            if po_known(pick["uk_port"], pick["dest_port"]):
+                sailings = await po_sailings(
+                    ctx["client"], date=depart_dt.strftime("%Y-%m-%d"),
+                    origin=pick["uk_port"], destination=pick["dest_port"],
+                    adults=2, vehicle="car",
+                )
+                avail = [s["best_price"] for s in sailings if s.get("best_price") is not None]
+                live = {
+                    "sailings": sailings,
+                    "best_price": min(avail) if avail else None,
+                    "currency": sailings[0]["currency"] if sailings else "GBP",
+                }
+        except (Exception,):
             live = None
 
     door_to_door = (
@@ -827,6 +871,7 @@ async def build_north_sea_ferry(
             (
                 "dfds-live" if live and "dfds" in op_lower else
                 "stena-line-live" if live and "stena" in op_lower else
+                "po-ferries-live" if live and ("p&o" in op_lower or "p and o" in op_lower) else
                 "static-table"
             ),
             "google-maps" if not pick["drive_home_fallback"] else "static-fallback",
