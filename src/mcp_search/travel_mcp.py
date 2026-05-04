@@ -513,6 +513,13 @@ async def travel_italy_journey(
     Torino/Bologna/etc.) plus deeplinks for booking on
     lefrecce.it (Trenitalia) and italotreno.com (Italo).
 
+    **Scope: Italy-INTERNAL only.** For Italy ↔ Switzerland cross-border
+    journeys (Milano ↔ Zermatt / Brig / Lugano / Zürich / Bern), use
+    `travel_sbb_journey` instead — SBB's HAFAS planner handles the
+    cross-border lookup correctly with live data, while this tool's
+    static table only carries domestic pairs. For live Italo prices on
+    domestic routes, use `travel_italy_prices_via_safari`.
+
     Args:
         origin: Italian city — 'milano', 'roma', 'firenze' (case-
                 insensitive substring on station name accepted too).

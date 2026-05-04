@@ -170,20 +170,29 @@ async def travel_sbb_journey(
     """Plan a journey via the Swiss SBB / transport.opendata.ch planner.
 
     **Scope** — this is a Switzerland-adjacent planner, not pan-European.
-    What works:
+    Use this tool whenever ONE end of the journey is in Switzerland or
+    the route transits Switzerland. SBB's HAFAS engine handles the
+    cross-border lookup correctly and is the ONLY tool that does:
+
+    What works (preferred for these):
+      - Italy ↔ Switzerland cross-border — Milano ↔ Zermatt / Zürich /
+        Brig / Lugano / Bern. Trenitalia + Italo can't plan past the
+        border, and Italy-static-table doesn't carry these pairs.
       - Anywhere ↔ anywhere via Switzerland (e.g. Lyon ↔ Wien via Zürich)
-      - Paris ↔ Italy via Lyria / Gotthard / Simplon (Paris→Milano live)
+      - Paris ↔ Italy via Lyria / Gotthard / Simplon (Paris ↔ Milano live)
       - Milano ↔ Germany via Zürich
       - Pure Switzerland-internal (Zürich ↔ Bern ↔ Genève)
-    What doesn't:
-      - Italy-internal (Milano ↔ Roma)             → use travel_italy_journey
-      - DB-internal or ÖBB-internal                → use travel_db / travel_austria_journey
-      - Pure DE↔AT routes (Brussels ↔ Berlin)      → use travel_db_journey
-      - Cross-Channel (London ↔ anywhere)          → use travel_eurostar_check
-      - Italian station names ⚠ silently mis-route — SBB's resolver picks
-        a plausible-looking Swiss/border station and the trip data is
-        wrong without erroring. Always cross-check with travel_italy_*
-        for Italy-internal sections.
+
+    What doesn't (use the right tool instead):
+      - Italy-internal (Milano ↔ Roma — both ends Italian)
+                                                    → travel_italy_journey
+      - DB-internal or ÖBB-internal                 → travel_db / travel_austria_journey
+      - Pure BE↔DE (Brussels ↔ Berlin)              → travel_db_journey
+      - Cross-Channel (London ↔ anywhere)           → travel_eurostar_check
+      - ⚠ Both ends in Italy: SBB silently mis-routes — its station
+        resolver picks plausible Swiss/border alternatives and the
+        returned trip looks valid but isn't. Cross-border (one Swiss
+        end, one Italian) is fine; both Italian is broken.
 
     `origin` and `destination` can be station names ("Zurich HB") or IDs.
     `datetime_iso` is ISO 8601 ('2026-06-15T09:00' or with timezone) —
