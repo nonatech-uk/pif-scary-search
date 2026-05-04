@@ -52,21 +52,33 @@ _RAW: list[tuple[str, str, int, list[str], str, str]] = [
 ]
 
 
-# City → station "long name" + Trenitalia / Italo deeplink slug
+# City → station name + per-operator booking codes.
+#
+# `italo_booking` is the code biglietti.italotreno.com expects in its
+# ricerca-treni URL (osc/dsc params). Two-letter prefix + underscore.
+# Only filled in for cities verified against the live site — leave
+# missing for cities not yet probed (the safari-pricecheck tool will
+# fail-soft and ask for a manual probe).
+#
+# Verified codes (DATE: 2026-05-04):
+#   MC_ = Milano Centrale
+#   RT_ = Roma Termini
+# Other codes below are educated guesses (Italian city-plate prefixes)
+# and need confirmation before use.
 CITIES: dict[str, dict[str, str]] = {
-    "milano":   {"station": "Milano Centrale",  "trenitalia": "MILANO+CENTRALE",  "italo": "MILC"},
-    "roma":     {"station": "Roma Termini",     "trenitalia": "ROMA+TERMINI",     "italo": "ROMT"},
-    "napoli":   {"station": "Napoli Centrale",  "trenitalia": "NAPOLI+CENTRALE",  "italo": "NAPC"},
-    "firenze":  {"station": "Firenze SMN",      "trenitalia": "FIRENZE+SMN",      "italo": "FRSN"},
-    "venezia":  {"station": "Venezia SL",       "trenitalia": "VENEZIA+S.+LUCIA", "italo": "VEZL"},
-    "torino":   {"station": "Torino Porta Nuova","trenitalia":"TORINO+P.+NUOVA",  "italo": "TOPN"},
-    "bologna":  {"station": "Bologna Centrale", "trenitalia": "BOLOGNA+CENTRALE", "italo": "BOLO"},
-    "verona":   {"station": "Verona Porta Nuova","trenitalia":"VERONA+P.+NUOVA",  "italo": "VRPN"},
-    "bari":     {"station": "Bari Centrale",    "trenitalia": "BARI+CENTRALE",    "italo": "BARI"},
-    "salerno":  {"station": "Salerno",          "trenitalia": "SALERNO",          "italo": "SALR"},
-    "bolzano":  {"station": "Bolzano",          "trenitalia": "BOLZANO",          "italo": ""},
-    "lugano":   {"station": "Lugano",           "trenitalia": "LUGANO",           "italo": ""},
-    "zurich":   {"station": "Zürich HB",        "trenitalia": "ZURIGO",           "italo": ""},
+    "milano":   {"station": "Milano Centrale",  "trenitalia": "MILANO+CENTRALE",  "italo_legacy": "MILC", "italo_booking": "MC_"},
+    "roma":     {"station": "Roma Termini",     "trenitalia": "ROMA+TERMINI",     "italo_legacy": "ROMT", "italo_booking": "RT_"},
+    "napoli":   {"station": "Napoli Centrale",  "trenitalia": "NAPOLI+CENTRALE",  "italo_legacy": "NAPC", "italo_booking": ""},
+    "firenze":  {"station": "Firenze SMN",      "trenitalia": "FIRENZE+SMN",      "italo_legacy": "FRSN", "italo_booking": ""},
+    "venezia":  {"station": "Venezia SL",       "trenitalia": "VENEZIA+S.+LUCIA", "italo_legacy": "VEZL", "italo_booking": ""},
+    "torino":   {"station": "Torino Porta Nuova","trenitalia":"TORINO+P.+NUOVA",  "italo_legacy": "TOPN", "italo_booking": ""},
+    "bologna":  {"station": "Bologna Centrale", "trenitalia": "BOLOGNA+CENTRALE", "italo_legacy": "BOLO", "italo_booking": ""},
+    "verona":   {"station": "Verona Porta Nuova","trenitalia":"VERONA+P.+NUOVA",  "italo_legacy": "VRPN", "italo_booking": ""},
+    "bari":     {"station": "Bari Centrale",    "trenitalia": "BARI+CENTRALE",    "italo_legacy": "BARI", "italo_booking": ""},
+    "salerno":  {"station": "Salerno",          "trenitalia": "SALERNO",          "italo_legacy": "SALR", "italo_booking": ""},
+    "bolzano":  {"station": "Bolzano",          "trenitalia": "BOLZANO",          "italo_legacy": "",     "italo_booking": ""},
+    "lugano":   {"station": "Lugano",           "trenitalia": "LUGANO",           "italo_legacy": "",     "italo_booking": ""},
+    "zurich":   {"station": "Zürich HB",        "trenitalia": "ZURIGO",           "italo_legacy": "",     "italo_booking": ""},
 }
 
 
@@ -104,13 +116,82 @@ def _trenitalia_url(o_slug: str, d_slug: str, date: str, adults: int) -> str:
 
 
 def _italo_url(o_slug: str, d_slug: str, date: str) -> str:
-    o = CITIES[o_slug].get("italo") or ""
-    d = CITIES[d_slug].get("italo") or ""
+    """Legacy Italo URL — points at the now-deprecated booking subdomain.
+    Kept for backwards compatibility with travel_italy_journey output.
+    For the working Safari-driven URL see _italo_booking_url() below."""
+    o = CITIES[o_slug].get("italo_legacy") or ""
+    d = CITIES[d_slug].get("italo_legacy") or ""
     if not o or not d:
         return ""
     return (
         f"https://www.italotreno.com/en/booking?from={o}&to={d}&date={date}"
     )
+
+
+def _italo_booking_url(o_slug: str, d_slug: str, date: str, adults: int) -> str:
+    """Italo's working URL shape (verified 2026-05-04 via Safari).
+    biglietti.italotreno.com auto-runs the search on `startSearch=true`
+    and lands on /booking/selezione-treno-andata with results rendered.
+    URL params get stripped after the search runs, but the SPA reads
+    them on initial load. Date format: DD/MM/YYYY URL-encoded."""
+    o = CITIES[o_slug].get("italo_booking") or ""
+    d = CITIES[d_slug].get("italo_booking") or ""
+    if not o or not d:
+        return ""
+    # Convert YYYY-MM-DD → DD/MM/YYYY
+    y, m, dd = date.split("-")
+    od = f"{dd}/{m}/{y}"
+    return (
+        "https://biglietti.italotreno.com/en/booking/ricerca-treni?"
+        f"osc={o}&dsc={d}&jt=single&od={quote(od)}&adt={adults}"
+        "&yng=0&chd=0&snr=0&inf=0&pet=0&promo=&lang=en&startSearch=true"
+    )
+
+
+def build_booking_urls(
+    origin_city: str,
+    destination_city: str,
+    date: str,
+    adults: int = 2,
+) -> dict[str, Any]:
+    """Resolve city slugs and return Italo's working booking URL plus
+    Trenitalia's deeplink (the latter requires manual form-fill since
+    lefrecce.it doesn't carry search state in the URL)."""
+    o = _resolve_city(origin_city)
+    d = _resolve_city(destination_city)
+    if not o or not d:
+        raise TrenitaliaError(
+            f"unknown Italian city {origin_city!r} or {destination_city!r}; "
+            f"known: {sorted(CITIES.keys())}"
+        )
+    try:
+        date_type.fromisoformat(date)
+    except ValueError as e:
+        raise TrenitaliaError(f"invalid date {date!r}: {e}") from e
+
+    italo_url = _italo_booking_url(o, d, date, adults)
+    italo_codes_missing = []
+    if not CITIES[o].get("italo_booking"):
+        italo_codes_missing.append(o)
+    if not CITIES[d].get("italo_booking"):
+        italo_codes_missing.append(d)
+
+    return {
+        "from_slug": o, "from": CITIES[o]["station"],
+        "to_slug": d, "to": CITIES[d]["station"],
+        "italo_booking_url": italo_url or None,
+        "italo_codes_missing": italo_codes_missing or None,
+        # Trenitalia/lefrecce.it doesn't accept URL params for autofill;
+        # link to the homepage instead. The user must run the search
+        # manually before reading prices off the rendered page.
+        "trenitalia_homepage": "https://www.lefrecce.it/",
+        "trenitalia_note": (
+            "Trenitalia's lefrecce.it strips search state from the URL — "
+            "auto-fill is not viable. To compare Trenitalia prices, the "
+            "user must run the search by hand at the homepage, then call "
+            "apple_browser_get_page_text on the rendered results."
+        ),
+    }
 
 
 async def search_journey(

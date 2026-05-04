@@ -44,7 +44,11 @@ from mcp_search.travel_sncf import SncfError, search_journey as sncf_search
 from mcp_search.travel_ns import NSError, search_journey as ns_search
 from mcp_search.travel_sncb import SNCBError, search_journey as sncb_search
 from mcp_search.travel_db import DBError, search_journey as db_search
-from mcp_search.travel_trenitalia import TrenitaliaError, search_journey as trenitalia_search
+from mcp_search.travel_trenitalia import (
+    TrenitaliaError,
+    search_journey as trenitalia_search,
+    build_booking_urls as italy_build_urls,
+)
 from mcp_search.travel_renfe import RenfeError, search_journey as renfe_search
 from mcp_search.travel_austria import AustriaError, search_journey as austria_search
 from mcp_search.travel_norway import NorwayError, search_journey as norway_search
@@ -526,6 +530,143 @@ async def travel_italy_journey(
                            "error": str(e), "origin": origin,
                            "destination": destination, "date": date}, indent=2)
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def travel_italy_prices_via_safari(
+    origin_city: str,
+    destination_city: str,
+    date: str,
+    adults: int = 2,
+) -> str:
+    """Italo train prices via the user's desktop Safari (apple_browser_*).
+
+    Italo (italotreno.com / biglietti.italotreno.com) has no public
+    pricing API but DOES carry search state in the URL — its SPA reads
+    `osc=` (origin code) / `dsc=` (destination code) / `od=DD/MM/YYYY` /
+    `adt=N` and auto-runs the search via `startSearch=true`. The page
+    settles on /booking/selezione-treno-andata with prices + seat
+    availability rendered as plain text.
+
+    Trenitalia (lefrecce.it) is NOT supported by this tool — its SPA
+    strips search state from the URL, so auto-fill isn't possible. To
+    compare Trenitalia, the user must run the search by hand on the
+    homepage and then call apple_browser_get_page_text manually.
+
+    Coverage: only city pairs whose Italo booking codes are known. So
+    far that's MC_ (Milano Centrale) and RT_ (Roma Termini) — verified
+    2026-05-04. Other Italian cities need their codes probed via a
+    one-off manual Italo search before this tool can build URLs for
+    them. Tool returns `italo_codes_missing` with the offending slugs
+    when codes haven't been verified yet.
+
+    Args:
+        origin_city: Italian city slug ('milano', 'roma', etc.) or
+                     case-insensitive substring of the station name.
+        destination_city: Same.
+        date: YYYY-MM-DD outbound date (auto-converted to DD/MM/YYYY
+              for the Italo URL).
+        adults: Pax count (default 2).
+
+    Workflow the calling LLM should run after this tool:
+      1. mcp__claude_ai_Mees_Only__apple_browser_open_url(url=<italo_booking_url>)
+      2. wait ~6 seconds for Italo's SPA to auto-run the search and
+         redirect to /booking/selezione-treno-andata
+      3. mcp__claude_ai_Mees_Only__apple_browser_get_page_text()
+      4. parse train rows: each block is 'HH:MM - HH:MM' / station /
+         'N h N min' / 'No available seats left' OR 'from £NN.NN in <fare>'
+    """
+    try:
+        urls = italy_build_urls(origin_city, destination_city, date, adults)
+    except TrenitaliaError as e:
+        return json.dumps({"ok": False, "mode": "rail", "country": "IT",
+                           "error": str(e)}, indent=2)
+
+    # Also pull the static-table journey for duration context
+    try:
+        timetable = await trenitalia_search(
+            _ctx()["client"], origin_city, destination_city, date, adults=adults,
+        )
+    except TrenitaliaError:
+        timetable = None
+
+    if urls.get("italo_codes_missing"):
+        workflow_note = (
+            f"Italo booking codes are not yet verified for: "
+            f"{', '.join(urls['italo_codes_missing'])}. The auto-fill URL "
+            "is empty — user must run the Italo search by hand at "
+            "https://www.italotreno.com/en, then provide the destination "
+            "code so the tool can build URLs for this pair next time."
+        )
+        workflow = [
+            {"step": 1, "tool": "mcp__claude_ai_Mees_Only__apple_browser_open_url",
+             "args": {"url": "https://www.italotreno.com/en"},
+             "purpose": "Open Italo homepage; user fills the form by hand"},
+            {"step": 2, "tool": None, "wait_seconds": 0,
+             "purpose": "Wait for the user to complete the search"},
+            {"step": 3, "tool": "mcp__claude_ai_Mees_Only__apple_browser_get_page_text",
+             "args": {}, "purpose": "Read prices off the rendered results"},
+        ]
+    else:
+        workflow_note = None
+        workflow = [
+            {"step": 1, "tool": "mcp__claude_ai_Mees_Only__apple_browser_open_url",
+             "args": {"url": urls["italo_booking_url"]},
+             "purpose": "Italo's SPA auto-runs the search via startSearch=true"},
+            {"step": 2, "tool": None, "wait_seconds": 6,
+             "purpose": "Wait for redirect to /selezione-treno-andata + render"},
+            {"step": 3, "tool": "mcp__claude_ai_Mees_Only__apple_browser_get_page_text",
+             "args": {}, "purpose": "Read trains + prices off the rendered page"},
+            {"step": 4, "tool": None,
+             "purpose": (
+                 "Parse train rows: each block is 'HH:MM - HH:MM' + "
+                 "station names + 'N h N min' + either 'No available "
+                 "seats left' OR 'from £NN.NN in <fare class>'."
+             )},
+        ]
+
+    parsing_hints = {
+        "price_pattern": r"from\s+(\d+(?:\.\d{2})?)\s*£",
+        "time_pattern": r"\d{2}:\d{2}\s*-\s*\d{2}:\d{2}",
+        "duration_pattern": r"\d+\s*h\s*\d+\s*min",
+        "fare_classes": ["Smart", "Comfort", "Prima", "Club Executive"],
+        "sold_out_marker": "No available seats left",
+        "next_day_marker": "+ 1 day",
+        "currency_note": (
+            "Italo localises currency to your IP / language setting. "
+            "lang=en + a UK source IP shows £ GBP; from an Italian IP "
+            "it'll show €. The price-pattern regex above assumes £; "
+            "swap the suffix character if the page text shows €."
+        ),
+    }
+
+    return json.dumps({
+        "ok": True,
+        "mode": "rail",
+        "country": "IT",
+        "service": "italy-safari-pricecheck",
+        "operator": "Italo",
+        "from": urls["from"], "from_slug": urls["from_slug"],
+        "to": urls["to"], "to_slug": urls["to_slug"],
+        "date": date,
+        "adults": adults,
+        "italo_booking_url": urls["italo_booking_url"],
+        "italo_codes_missing": urls.get("italo_codes_missing"),
+        "trenitalia_homepage": urls["trenitalia_homepage"],
+        "trenitalia_note": urls["trenitalia_note"],
+        "static_timetable": (
+            {"direct": timetable.get("direct"),
+             "minutes": timetable.get("minutes"),
+             "operators": timetable.get("operators"),
+             "frequency": timetable.get("frequency")}
+            if isinstance(timetable, dict) else None
+        ),
+        "workflow": workflow,
+        "workflow_note": workflow_note,
+        "parsing_hints": parsing_hints,
+        "data_sources": ["italo-via-safari", "static-table"],
+        "as_of": datetime.utcnow().isoformat() + "Z",
+    }, indent=2)
 
 
 @mcp.tool()
