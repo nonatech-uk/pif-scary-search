@@ -99,11 +99,33 @@ async def build_eurotunnel(
     drive_min_fr = int(round(drive_calais["duration_minutes"]))
 
     et = await eurotunnel_check(
-        None, date=depart_dt.strftime("%Y-%m-%d"),
+        ctx["client"], date=depart_dt.strftime("%Y-%m-%d"),
         time=crossing_depart_uk.strftime("%H:%M"), vehicle="car", passengers=2,
     )
 
+    # If we got live data, prefer the actual booked crossing time (the API
+    # rounds to its real timetable; our calc was just a target).
+    et_live = "leshuttle-live" in (et.get("data_sources") or [])
+    selected = et.get("selected_crossing") or {}
+    actual_dep_iso = selected.get("departure")
+    if et_live and actual_dep_iso:
+        try:
+            actual_dep = datetime.fromisoformat(actual_dep_iso.replace("Z", ""))
+            crossing_depart_uk = actual_dep
+            crossing_arrive_fr = actual_dep + timedelta(minutes=35 + 5)
+        except (ValueError, TypeError):
+            pass
+
+    best_price = selected.get("best_price")
+    currency = et.get("currency") or "GBP"
+
     door_to_door = drive_min_uk + PREDEPARTURE_BUFFER_MIN + 35 + 5 + drive_min_fr
+    crossing_note = "35 min crossing + 5 min customs/disembark"
+    if et_live and actual_dep_iso:
+        crossing_note = f"{crossing_note}; live slot {crossing_depart_uk.strftime('%H:%M')}"
+        if best_price is not None:
+            crossing_note += f", from {currency} {best_price}"
+
     legs = [
         {"kind": "drive", "from": origin_label, "to": "Folkestone Terminal",
          "minutes": drive_min_uk, "operator": "self-drive",
@@ -113,8 +135,12 @@ async def build_eurotunnel(
          "minutes": PREDEPARTURE_BUFFER_MIN, "note": "60-min pre-departure buffer"},
         {"kind": "crossing", "from": "Folkestone", "to": "Calais Coquelles",
          "minutes": 40, "operator": "LeShuttle",
+         "depart": crossing_depart_uk.isoformat() if et_live else None,
+         "arrive": crossing_arrive_fr.isoformat() if et_live else None,
+         "price_gbp": best_price if currency == "GBP" else None,
+         "price": best_price, "price_currency": currency if best_price is not None else None,
          "booking_url": et.get("booking_url"),
-         "note": "35 min crossing + 5 min customs/disembark"},
+         "note": crossing_note},
         {"kind": "drive", "from": "Calais Coquelles", "to": dest["display_name"],
          "minutes": drive_min_fr, "operator": "self-drive",
          "note": f"{drive_calais.get('distance_km','?')} km via French motorway"
@@ -126,9 +152,12 @@ async def build_eurotunnel(
         "door_to_door_minutes": door_to_door,
         "transfers": 1,
         "legs": legs,
-        "data_sources": ["static-timetable",
-                         "google-maps" if not drive_to_folkestone.get("fallback") else "static-fallback",
-                         "google-maps" if not drive_calais.get("fallback") else "static-fallback"],
+        "total_cost_gbp": best_price if (currency == "GBP" and best_price is not None) else None,
+        "data_sources": [
+            "leshuttle-live" if et_live else "static-timetable",
+            "google-maps" if not drive_to_folkestone.get("fallback") else "static-fallback",
+            "google-maps" if not drive_calais.get("fallback") else "static-fallback",
+        ],
         "booking_urls": [et.get("booking_url")],
         "trade_offs": [
             "Take your own car — no transfers at the destination, room for luggage.",

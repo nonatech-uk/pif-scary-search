@@ -258,9 +258,18 @@ async def _drive_impl(
 
 
 async def _eurotunnel_impl(
-    ctx: dict, date: str, time: str, vehicle: str, passengers: int
+    ctx: dict,
+    date: str,
+    time: str,
+    vehicle: str,
+    passengers: int,
+    direction: str = "FOCA",
+    country_of_residence: str = "GB",
 ) -> dict[str, Any]:
-    args = {"date": date, "time": time, "vehicle": vehicle, "passengers": passengers}
+    args = {
+        "date": date, "time": time, "vehicle": vehicle, "passengers": passengers,
+        "direction": direction, "cor": country_of_residence,
+    }
     bucket = date_type.fromisoformat(date)
 
     cached = await cache_get(ctx["pool"], "eurotunnel_check", args, bucket)
@@ -270,7 +279,13 @@ async def _eurotunnel_impl(
 
     try:
         result = await eurotunnel_scrape(
-            ctx.get("browser"), date=date, time=time, vehicle=vehicle, passengers=passengers
+            ctx.get("client"),
+            date=date,
+            time=time,
+            vehicle=vehicle,
+            passengers=passengers,
+            direction=direction,
+            country_of_residence=country_of_residence,
         )
     except EurotunnelError as e:
         return {
@@ -282,7 +297,9 @@ async def _eurotunnel_impl(
             "vehicle": vehicle,
         }
 
-    await cache_set(ctx["pool"], "eurotunnel_check", args, bucket, result, _TTL_SCRAPER)
+    # Cache live results for 6h (prices can move); fallback for 24h.
+    ttl = 6 * 3600 if "leshuttle-live" in (result.get("data_sources") or []) else _TTL_SCRAPER
+    await cache_set(ctx["pool"], "eurotunnel_check", args, bucket, result, ttl)
     result["cached"] = False
     return result
 
@@ -812,15 +829,36 @@ async def travel_eurotunnel_check(
     time: str = "10:00",
     vehicle: str = "car",
     passengers: int = 2,
+    direction: str = "FOCA",
+    country_of_residence: str = "GB",
 ) -> str:
-    """Get the lowest GBP fare for a LeShuttle (Eurotunnel) crossing.
+    """Live LeShuttle (Eurotunnel) crossings + GBP prices for a date.
 
-    Folkestone → Calais Coquelles only. Vehicle 'car'/'high-vehicle'/
-    'caravan-trailer'/'motorhome'/'motorcycle' (aliases accepted).
-    Cache TTL 24h.
+    Calls the public `nextus-api-prod.leshuttle.com/ExactViewQuote`
+    endpoint — same one the website uses — and returns:
+      - `selected_crossing`: the crossing nearest `time` (with prices)
+      - `crossings`: every available slot for the day with per-ticket-type
+        prices (Standard, FlexiLongstay, etc.) and best_price
+
+    Args:
+        date: Departure date (YYYY-MM-DD).
+        time: Preferred departure time HH:MM (used to pick selected_crossing).
+        vehicle: 'car' / 'high-vehicle' / 'caravan-trailer' / 'motorhome' /
+                 'motorcycle' — aliases accepted.
+        passengers: For deeplink only (LeShuttle prices by vehicle, not pax).
+        direction: 'FOCA' = Folkestone→Calais (default), 'CAFO' = reverse.
+        country_of_residence: ISO-2 code; affects displayed currency
+                              (GB → GBP, FR → EUR).
+
+    Falls back to static-table durations if the live API errors. Live
+    cache TTL 6h, fallback 24h.
     """
     return json.dumps(
-        await _eurotunnel_impl(_ctx(), date, time, vehicle, passengers), indent=2
+        await _eurotunnel_impl(
+            _ctx(), date, time, vehicle, passengers,
+            direction=direction, country_of_residence=country_of_residence,
+        ),
+        indent=2,
     )
 
 
