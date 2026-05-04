@@ -489,6 +489,182 @@ def _parse_iso_duration_min(s: str) -> int:
     return total
 
 
+async def build_irish_sea_ferry(
+    ctx, dest: dict, depart_dt: datetime,
+    origin: str = ORIGIN_HOME_DEFAULT, origin_label: str = ORIGIN_HOME_LABEL_DEFAULT,
+) -> dict[str, Any]:
+    """Drive to a UK port → Irish Sea ferry → drive to destination in IE/NI.
+
+    Picks the optimal UK port for the (origin, dest) pair by scoring
+    drive-home-to-port + crossing-time + drive-port-to-dest. Live prices
+    where available (Stena Line GraphQL); other operators static.
+
+    Common picks from Surrey origin:
+      - Holyhead → Dublin (Stena live, £64-220 + 195min crossing)
+      - Liverpool → Dublin (P&O overnight cabin, longer)
+      - Pembroke → Rosslare (Irish Ferries, useful for SW Ireland)
+      - Cairnryan → Belfast (Stena live, only sensible for Scotland origins)
+    """
+    # UK port candidates. Each row carries a static "Irish-side port → typical
+    # major city drive-time" used for ranking — Dublin Port is 5 min to Dublin
+    # centre but 150 min from Rosslare; we don't want to pick Rosslare for a
+    # Dublin-bound trip just because the crossing's a few minutes shorter.
+    UK_PORTS = [
+        # uk_geo, uk_port_name, ie_geo, ie_port_name, crossing_min, operator,
+        # dest_pref, static_drive_dub_min, static_drive_bel_min
+        ("Holyhead, UK",     "Holyhead",     "Dublin Port, IE",   "Dublin",   195, "Stena Line",     "IE",   5, 120),
+        ("Holyhead, UK",     "Holyhead",     "Dublin Port, IE",   "Dublin",   210, "Irish Ferries",  "IE",   5, 120),
+        ("Liverpool, UK",    "Liverpool",    "Dublin Port, IE",   "Dublin",   480, "P&O Ferries",    "IE",   5, 120),
+        ("Pembroke Dock, UK","Pembroke Dock","Rosslare, IE",      "Rosslare", 240, "Irish Ferries",  "IE", 150, 270),
+        ("Fishguard, UK",    "Fishguard",    "Rosslare, IE",      "Rosslare", 210, "Stena Line",     "IE", 150, 270),
+        ("Cairnryan, UK",    "Cairnryan",    "Belfast, GB",       "Belfast",  135, "Stena Line",     "NI", 120,  10),
+        ("Cairnryan, UK",    "Cairnryan",    "Larne, GB",         "Larne",    120, "P&O Ferries",    "NI", 120,  30),
+        ("Liverpool, UK",    "Liverpool",    "Belfast, GB",       "Belfast",  480, "Stena Line",     "NI", 120,  10),
+    ]
+
+    # Determine if destination is in ROI or NI based on coords. Used both
+    # for the final-drive estimate and to prefer same-side ports.
+    is_ni_dest = dest["lat"] >= 54.0 and dest["lon"] >= -8.0  # rough NI box
+
+    # Score each candidate = drive home → UK port + crossing + static
+    # estimate of port→destination-country-centre drive (the lattermost
+    # is what makes Holyhead-Dublin beat Fishguard-Rosslare for a Dublin
+    # destination — the actual Port→Lucan drive is computed for the
+    # winner only).
+    async def _score(uk_geo, uk_name, ie_geo, ie_name, crossing_min, op,
+                     dest_pref, static_dub, static_bel):
+        d = await _drive_or_fallback(
+            ctx["client"], origin, uk_geo,
+            _to_iso_z(depart_dt), fallback_min=300,
+        )
+        static_final = static_bel if is_ni_dest else static_dub
+        return {
+            "uk_port_geo": uk_geo, "uk_port": uk_name,
+            "ie_port_geo": ie_geo, "ie_port": ie_name,
+            "crossing_min": crossing_min, "operator": op,
+            "dest_pref": dest_pref,
+            "drive_home_min": int(round(d["duration_minutes"])),
+            "drive_home_km": d.get("distance_km"),
+            "drive_home_fallback": d.get("fallback", False),
+            "static_final_drive_min": static_final,
+            "estimated_total_min": int(round(d["duration_minutes"])) + crossing_min + static_final,
+        }
+    scored = await asyncio.gather(*[_score(*p) for p in UK_PORTS])
+
+    # Sort by full-trip estimate (drive home + crossing + port→dest-centre).
+    # Ports already routing to the right country naturally win since their
+    # static_final is small.
+    scored.sort(key=lambda x: x["estimated_total_min"])
+    pick = scored[0]
+
+    # Live prices: Stena GraphQL for Holyhead-Dublin / Cairnryan-Belfast / Fishguard-Rosslare
+    live: dict[str, Any] | None = None
+    if "stena" in pick["operator"].lower():
+        try:
+            from mcp_search.travel_stena_line import (
+                get_sailings as stena_sailings, is_known_route as stena_known, StenaLineError,
+            )
+            if stena_known(pick["uk_port"], pick["ie_port"]):
+                sailings = await stena_sailings(
+                    ctx["client"], date=depart_dt.strftime("%Y-%m-%d"),
+                    origin=pick["uk_port"], destination=pick["ie_port"],
+                    adults=2, vehicle="car", currency="GBP",
+                )
+                avail = [s["best_price"] for s in sailings if s.get("best_price") is not None]
+                live = {
+                    "sailings": sailings,
+                    "best_price": min(avail) if avail else None,
+                    "currency": sailings[0]["currency"] if sailings else "GBP",
+                }
+        except (Exception,):
+            live = None
+
+    # Drive at destination (IE port → final destination)
+    drive_target_lat, drive_target_lon, carfree = _resolve_drive_target(dest)
+    final_legs = _final_leg_from(carfree)
+    final_minutes = sum(l["minutes"] for l in final_legs)
+
+    arrive_ie = depart_dt + timedelta(
+        minutes=pick["drive_home_min"] + 60 + pick["crossing_min"] + 30,
+    )
+    drive_dest = await _drive_or_fallback(
+        ctx["client"], pick["ie_port_geo"], f"{drive_target_lat},{drive_target_lon}",
+        _to_iso_z(arrive_ie), fallback_min=120,
+    )
+    drive_min_dest = int(round(drive_dest["duration_minutes"]))
+
+    door_to_door = (
+        pick["drive_home_min"] + 60 + pick["crossing_min"] + 30 + drive_min_dest + final_minutes
+    )
+
+    ferry_note = f"{pick['crossing_min']} min crossing"
+    if live and live.get("best_price"):
+        ferry_note += f", from {live['currency']} {live['best_price']}"
+
+    legs = [
+        {
+            "kind": "drive", "from": origin_label, "to": pick["uk_port"],
+            "minutes": pick["drive_home_min"], "operator": "self-drive",
+            "note": f"{pick['drive_home_km']} km"
+                    + (" (live traffic)" if not pick["drive_home_fallback"] else " (static estimate)"),
+        },
+        {
+            "kind": "wait", "from": pick["uk_port"], "to": pick["uk_port"],
+            "minutes": 60, "note": "60-min pre-departure (vehicle check-in)",
+        },
+        {
+            "kind": "ferry", "from": pick["uk_port"], "to": pick["ie_port"],
+            "minutes": pick["crossing_min"], "operator": pick["operator"],
+            "price": (live or {}).get("best_price"),
+            "price_currency": (live or {}).get("currency"),
+            "note": ferry_note,
+        },
+        {
+            "kind": "wait", "from": pick["ie_port"], "to": pick["ie_port"],
+            "minutes": 30, "note": "Vehicle disembarkation + customs",
+        },
+        {
+            "kind": "drive", "from": pick["ie_port"],
+            "to": (carfree["parking_name"] if carfree else dest["display_name"]),
+            "minutes": drive_min_dest, "operator": "self-drive",
+            "note": f"{drive_dest.get('distance_km','?')} km"
+                    + (" (live traffic)" if not drive_dest.get("fallback") else " (static estimate)"),
+        },
+        *final_legs,
+    ]
+    return {
+        "ok": True,
+        "mode": "irish_sea_ferry",
+        "door_to_door_minutes": door_to_door,
+        "transfers": 1,
+        "legs": legs,
+        "total_cost_gbp": (
+            live["best_price"]
+            if live and live.get("currency") == "GBP" and live.get("best_price") is not None
+            else None
+        ),
+        "data_sources": [
+            "stena-line-live" if live else "static-table",
+            "google-maps" if not pick["drive_home_fallback"] else "static-fallback",
+            "google-maps" if not drive_dest.get("fallback") else "static-fallback",
+        ],
+        "booking_urls": [],
+        "trade_offs": [
+            f"Take your own car to Ireland — {pick['operator']} {pick['uk_port']}→{pick['ie_port']}.",
+            f"Drive home: {pick['drive_home_min']} min. Crossing: {pick['crossing_min']} min.",
+            *([
+                f"Faster than via {alt['uk_port']} ({alt['estimated_total_min']} vs "
+                f"{pick['estimated_total_min']} min including final drive across Ireland)"
+                for alt in scored[1:2]
+            ]),
+        ],
+        "summary": (
+            f"{pick['uk_port']} → {pick['ie_port']} ({pick['operator']}): "
+            f"{door_to_door} min door-to-door"
+        ),
+    }
+
+
 async def build_north_sea_ferry(
     ctx, dest: dict, depart_dt: datetime,
     origin: str = ORIGIN_HOME_DEFAULT, origin_label: str = ORIGIN_HOME_LABEL_DEFAULT,
@@ -827,6 +1003,10 @@ async def plan_trip_impl(
         elif m == "north_sea_ferry":
             tasks.append(("north_sea_ferry",
                           build_north_sea_ferry(ctx, geo, depart_dt,
+                                                origin=origin, origin_label=origin_label)))
+        elif m == "irish_sea_ferry":
+            tasks.append(("irish_sea_ferry",
+                          build_irish_sea_ferry(ctx, geo, depart_dt,
                                                 origin=origin, origin_label=origin_label)))
 
     # Optional multi-day-drive option triggered by overnight_near

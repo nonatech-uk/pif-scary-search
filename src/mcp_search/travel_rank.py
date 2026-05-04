@@ -74,6 +74,11 @@ def classify_region(lat: float, lon: float, query: str | None = None) -> str:
             if k in q:
                 return "alps-ski"
 
+    # Ireland (both ROI + NI — same Irish Sea ferry routing logic). Must
+    # come BEFORE the UK box, since Ireland sits inside it geographically.
+    if 51.4 <= lat <= 55.5 and -10.8 <= lon <= -5.4:
+        return "ireland"
+
     # UK shortcut (rare but plan_trip might still get a UK destination)
     if 49.5 <= lat <= 60.0 and -8.5 <= lon <= 2.0:
         return "uk"
@@ -144,6 +149,7 @@ REGION_MODES: dict[str, list[str]] = {
     "alps-ski":               ["fly_geneva_drive", "eurostar", "eurotunnel", "north_sea_ferry"],
     "switzerland":            ["flight", "eurostar", "eurotunnel", "north_sea_ferry"],
     "belgium-netherlands":    ["eurostar", "flight", "north_sea_ferry"],
+    "ireland":                ["irish_sea_ferry", "flight"],
     "generic-fr":             ["eurotunnel", "flight", "eurostar"],
     "generic-eu":             ["flight", "north_sea_ferry"],
     "uk":                     [],
@@ -166,6 +172,7 @@ REGION_AIRPORTS: dict[str, dict[str, list[str]]] = {
     "alps-ski":               {"origin": ["LGW", "LHR"], "destination": ["GVA"]},
     "switzerland":            {"origin": ["LGW", "LHR"], "destination": ["GVA", "ZRH", "BSL"]},
     "belgium-netherlands":    {"origin": ["LGW", "LHR"], "destination": ["BRU", "AMS"]},
+    "ireland":                {"origin": ["LGW", "LHR", "STN"], "destination": ["DUB", "ORK", "SNN", "BFS"]},
 }
 
 
