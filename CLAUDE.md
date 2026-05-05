@@ -3,7 +3,7 @@
 Multi-server FastMCP project. One container image (`localhost/mcp-search:latest`) bundles many
 servers; per-server quadlets pick which module runs via `Exec=mcp_search.<module>`.
 
-## Servers (23, all FastMCP, streamable-http behind the gateway)
+## Servers (20, all FastMCP, streamable-http behind the gateway)
 
 Read-only / search:
 - `postgres_mcp` · `paperless_mcp` · `meilisearch_mcp` · `loki_mcp` · `mariadb_mcp`
@@ -15,27 +15,14 @@ Read + write / control-plane:
 - `mailcow_mcp` · `mailcow_albury_mcp` · `spotify_mcp`
 
 Domain integrations:
-- `sbb_mcp` (Swiss rail) · `uk_trains_mcp` (RTT/TAPI) · `travel_mcp` (door-to-door trip planner)
-
-The **travel** suite spans `travel_mcp.py` (FastMCP entrypoint) plus `travel_*.py` helpers:
-`travel_cache`, `travel_geocode`, `travel_drive` (Google Maps Routes), `travel_duffel`
-(flights), `travel_sncf` (Navitia), `travel_eurostar` / `travel_eurotunnel` (static
-durations), `travel_liteapi` + `travel_hotels` (LiteAPI hotel search), `travel_rank`
-(region classifier + scoring), `travel_plan` (`plan_trip` orchestrator).
+- (none — `travel_mcp`, `sbb_mcp`, `uk_trains_mcp` were extracted to
+  [github.com/nonatech-uk/mcp-travel](https://github.com/nonatech-uk/mcp-travel) on 2026-05-05)
 
 ## Build
 
 ```bash
 podman build -t mcp-search:latest .
 ```
-
-The travel suite uses a second-stage image:
-
-```bash
-podman build -t mcp-search-travel:latest -f Containerfile.travel .
-```
-
-(currently a thin layer over the base; held open in case Playwright comes back)
 
 ## Quadlets
 
